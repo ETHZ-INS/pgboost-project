@@ -57,48 +57,8 @@ scent_obj <- SCENT_algorithm(
   maxboot = if (!skip_bootstrap) max_bootstrap_iter else NULL
 )
 
-# test small dont do this if the full one worked just write
-links <- links[1:100, ]
-
-scent_obj <- CreateSCENTObj(
-  rna = rna_mtx,
-  atac = atac_mtx,
-  meta.data = meta,
-  peak.info = links,
-  covariates = c("log_nUMI", "percent.mito"),
-  celltypes = "celltype"
-)
-
-
-scent_obj <- SCENT_algorithm(
-  object = scent_obj,
-  celltype = "focal",
-  ncores = 1,
-  boot = FALSE
-)
-
 head(scent_obj@SCENT.result)
 
-# back to doing it on full data
-links <- read.table("output/scent_candidate_links/chunk1.txt", sep = "\t", header = FALSE)
-colnames(links) <- c("gene", "peak")
-
-scent_obj <- CreateSCENTObj(
-  rna = rna_mtx,
-  atac = atac_mtx,
-  meta.data = meta,
-  peak.info = links,
-  covariates = c("log_nUMI", "percent.mito"),
-  celltypes = "celltype"
-)
-
-#burda kaldım
-scent_obj <- SCENT_algorithm(
-  object = scent_obj,
-  celltype = "focal",
-  ncores = 1,           
-  boot = FALSE          # Keep FALSE for pgBoost
-)
 # just write part is this
 write.table(scent_obj@SCENT.result,
             "output/scent/chunk1_output.tsv",
