@@ -1,0 +1,359 @@
+---
+title: "eQTL-preparation"
+author: "tobias"
+date: "2025-07-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/mnt/germain/work/tomohl/pgBoost-HumanData") 
+setwd("/mnt/germain/work/tomohl/pgBoost-HumanData")
+
+
+library(EnsDb.Hsapiens.v86)
+library(GenomicRanges)
+library(rtracklayer)
+library(Signac)
+library(Seurat)
+library(future)
+library(Matrix)
+library(HDF5Array)
+
+plan("multicore", workers = 4)
+```
+
+# eQTLs
+## Download Files
+```{r}
+# List of pooled cell types
+cell_types <- c("Ast", "End", "Ext", "IN", "MG", "OD", "OPC")
+
+# Base URL for Zenodo record (v1, Zenodo ID 14908182)
+base_url <- "https://zenodo.org/records/14908182/files"
+
+# Files to download
+files <- paste0(cell_types, "_eqtl_full_assoc.tsv.gz")
+
+
+# Destination path
+dir.create("data/eqtl_files", showWarnings = FALSE)
+options(timeout = max(300, getOption("timeout")))
+
+# Download loop
+for (f in files) {
+  url <- paste0(base_url, "/", f, "?download=1")
+  dest <- file.path("data/eqtl_files", f)  
+  message("Downloading ", f, " ...")
+  try(download.file(url, destfile = dest, mode = "wb"))
+}
+```
+
+# Load Data
+```{r}
+library(data.table)
+library(GenomicRanges)
+
+# Load candidate peak–gene pairs
+candidates <- fread("data/candidate_peak_gene_pairs.tsv")
+
+# Load consensus peak set
+peaks <- readRDS("data/consensus_peak_set.rds")
+seqlevelsStyle(peaks) <- "UCSC"  # Match eQTL style
+
+# Load variant map to get SNP coordinates
+variant_map <- fread("data/eqtl_files/variant_id_map.tsv.gz")  # has: variant_id, chr, pos
+
+```
+
+# Create TSS file
+```{r}
+ensdb <- EnsDb.Hsapiens.v86
+genes <- genes(ensdb, filter = ~ gene_biotype == "protein_coding")
+
+gene_tss <- GRanges(
+  seqnames = seqnames(genes),
+  ranges = IRanges(
+    start = ifelse(strand(genes) == "+", start(genes), end(genes)),
+    width = 1
+  ),
+  strand = strand(genes),
+  gene_id = genes$gene_id,
+  gene_name = genes$gene_name
+)
+
+# Save TSS as BED
+tss_bed <- data.frame(
+  chr = as.character(seqnames(gene_tss)),
+  start = start(gene_tss) - 1,  # BED is 0-based
+  end = start(gene_tss),
+  gene_name = gene_tss$gene_name,
+  gene_id = gene_tss$gene_id
+)
+getwd()
+write.table(tss_bed, file = "data/human_tss.bed", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+```
+
+# Load ATAC
+```{r}
+# Load annotated RNA
+seo <- readRDS("/mnt/germain/work/tomohl/pgBoost-HumanData/data/seo_all_samples_proteincoding_annotated.rds")
+
+peak_files <- list.files(
+  path = "/mnt/germain/work/tomohl/pgBoost-HumanData/data/raw_data",
+  pattern = "atac_peaks.bed.gz",
+  full.names = TRUE,
+  recursive = TRUE
+)
+
+peak_list <- lapply(peak_files, function(f) {
+  gr <- import(f)
+  seqlevelsStyle(gr) <- "UCSC"
+  keepStandardChromosomes(gr, pruning.mode = "coarse")
+})
+
+consensus_peaks <- reduce(do.call(c, peak_list))
+saveRDS(consensus_peaks, file = "data/consensus_peak_set.rds")
+
+```
+
+# Index Fragment files
+```{bash}
+cd /mnt/germain/work/tomohl/pgBoost-HumanData/data/raw_data
+
+# Find and index all fragments.tsv.gz files
+find . -name "*fragments.tsv.gz" | while read frag; do
+  echo "Indexing $frag"
+  tabix -p bed "$frag"
+done
+```
+
+# Create PeakMatrix
+```{r}
+# Get list of fragment files
+fragment_paths <- list.files(
+  path = "/mnt/germain/work/tomohl/pgBoost-HumanData/data/raw_data",
+  pattern = "fragments.tsv.gz$",
+  full.names = TRUE,
+  recursive = TRUE
+)
+
+# Determine sample IDs from your Seurat barcodes
+cell_prefixes <- unique(sub("_.*", "", colnames(seo)))
+frag_objects <- list()
+
+
+for (frag_path in fragment_paths) {
+  sample_dir <- basename(dirname(frag_path))
+  matched_id <- grep(sample_dir, cell_prefixes, value = TRUE)
+  if (length(matched_id) != 1) next
+
+  # Match barcodes from Seurat
+  sample_cells <- colnames(seo)[startsWith(colnames(seo), paste0(matched_id, "_"))]
+  raw_barcodes <- sub(".*?_", "", sample_cells)
+
+  # Create fragment object
+  frag <- CreateFragmentObject(path = frag_path, cells = raw_barcodes)
+
+  # Create peak × cell matrix
+  mat <- FeatureMatrix(
+    fragments = frag,
+    features = consensus_peaks,
+    cells = raw_barcodes
+  )
+
+  # Rename barcodes back to Seurat format
+  colnames(mat) <- sample_cells
+  frag_objects[[matched_id]] <- mat
+
+  cat("✔ Processed", matched_id, "with", ncol(mat), "cells\n")
+}
+
+
+# Combine all matrices (sparse, in memory)
+combined_peak_mat <- do.call(cbind, frag_objects)
+
+# Save combined matrix to disk as HDF5
+writeHDF5Array(
+  combined_peak_mat,
+  filepath = "/mnt/germain/work/tomohl/pgBoost-HumanData/data/combined_ATAC_peak_matrix.h5",
+  name = "peaks"
+)
+
+```
+
+## Load PeakMatrix
+```{r}
+library(HDF5Array)
+peak_mat <- HDF5Array(
+  filepath = "/mnt/germain/work/tomohl/pgBoost-HumanData/data/combined_ATAC_peak_matrix.h5",
+  name = "peaks"
+)
+```
+
+# Generate Candidate_peak_gene_paurs.tsv
+```{r}
+# Load consensus peaks
+peaks <- readRDS("data/consensus_peak_set.rds")
+
+# Convert to peak center
+peak_centers <- resize(peaks, width = 1, fix = "center")
+peak_centers$peak_id <- paste0(seqnames(peak_centers), ":", start(peak_centers))
+
+# Extend to ±500 kb window
+peak_window <- resize(peak_centers, width = 1000001, fix = "center")
+
+# Load protein-coding gene TSSs
+ensdb <- EnsDb.Hsapiens.v86
+genes <- genes(ensdb, filter = ~ gene_biotype == "protein_coding")
+
+tss <- GRanges(
+  seqnames = seqnames(genes),
+  ranges = IRanges(
+    start = ifelse(strand(genes) == "+", start(genes), end(genes)),
+    width = 1
+  ),
+  strand = strand(genes),
+  gene_id = genes$gene_id
+)
+
+# Match genome style
+GenomeInfoDb::seqlevelsStyle(tss) <- "UCSC"
+GenomeInfoDb::seqlevelsStyle(peak_window) <- "UCSC"
+
+# Find overlaps: peak window ↔ gene TSS
+hits <- findOverlaps(peak_window, tss, ignore.strand = TRUE)
+
+# Assemble candidate table
+candidates <- data.table(
+  peak_id = peak_window$peak_id[queryHits(hits)],
+  gene_id = tss$gene_id[subjectHits(hits)]
+)
+
+# Filter to peaks on chr1, chr2, chr3 only
+candidates <- candidates[grepl("^chr[123]:", peak_id)]
+# Save
+fwrite(candidates, "data/candidate_peak_gene_pairs.tsv", sep = "\t")
+
+cat("Saved", nrow(candidates), "candidate peak–gene pairs\n")
+```
+
+# Label Candidate pairs
+```{r}
+label_peak_gene_pairs <- function(
+  cell_type,
+  candidate_file = "data/candidate_peak_gene_pairs.tsv",
+  eqtl_dir = "data/eqtl_files",
+  consensus_peaks_file = "data/consensus_peak_set.rds",
+  output_file = NULL,
+  pos_cutoff = 1e-6,
+  neg_cutoff = 0.4,
+  power_cutoff = 0.01
+) {
+  message("Generating labeled training data for: ", cell_type)
+  
+  if (is.null(output_file)) {
+    output_file <- file.path(eqtl_dir, paste0("training_data_", cell_type, ".tsv.gz"))
+  }
+
+  # Load candidate pairs
+  candidates <- data.table::fread(candidate_file)
+
+  # Load eQTL
+  eqtl_path <- file.path(eqtl_dir, paste0(cell_type, "_eqtl_full_assoc.tsv.gz"))
+  eqtl <- data.table::fread(eqtl_path, select = c("feature", "variant_id", "Fixed_P", "chr", "pos"))
+  eqtl[, gene_id := sub("\\..*", "", feature)]
+
+  # Step 1: Positives (label = 1)
+  positives <- eqtl[Fixed_P < pos_cutoff]
+  snp_gr_pos <- GenomicRanges::GRanges(
+    seqnames = positives$chr,
+    ranges = IRanges::IRanges(start = positives$pos, width = 1),
+    gene_id = positives$gene_id
+  )
+
+  peaks <- readRDS(consensus_peaks_file)
+  GenomeInfoDb::seqlevelsStyle(peaks) <- "UCSC"
+
+  hits_pos <- GenomicRanges::findOverlaps(snp_gr_pos, peaks)
+  peak_ids_pos <- paste0(
+    GenomicRanges::seqnames(peaks)[S4Vectors::subjectHits(hits_pos)], ":",
+    GenomicRanges::start(peaks)[S4Vectors::subjectHits(hits_pos)] + 
+      floor((GenomicRanges::width(peaks)[S4Vectors::subjectHits(hits_pos)] - 1) / 2)
+  )
+
+  labeled_pos <- data.table::data.table(
+    peak_id = peak_ids_pos,
+    gene_id = snp_gr_pos$gene_id[S4Vectors::queryHits(hits_pos)],
+    label = 1L
+  )
+
+  # Step 2: Negatives (label = 2)
+  weak <- eqtl[Fixed_P > neg_cutoff]
+  strong <- eqtl[Fixed_P < power_cutoff]
+  powered_genes <- unique(strong$gene_id)
+  powered_snps  <- unique(strong$variant_id)
+  powered_neg <- weak[gene_id %in% powered_genes & variant_id %in% powered_snps]
+
+  snp_gr_neg <- GenomicRanges::GRanges(
+    seqnames = powered_neg$chr,
+    ranges = IRanges::IRanges(start = powered_neg$pos, width = 1),
+    gene_id = powered_neg$gene_id
+  )
+  hits_neg <- GenomicRanges::findOverlaps(snp_gr_neg, peaks)
+  peak_ids_neg <- paste0(
+    GenomicRanges::seqnames(peaks)[S4Vectors::subjectHits(hits_neg)], ":",
+    GenomicRanges::start(peaks)[S4Vectors::subjectHits(hits_neg)] + 
+      floor((GenomicRanges::width(peaks)[S4Vectors::subjectHits(hits_neg)] - 1) / 2)
+  )
+
+  labeled_neg <- data.table::data.table(
+    peak_id = peak_ids_neg,
+    gene_id = snp_gr_neg$gene_id[S4Vectors::queryHits(hits_neg)],
+    label = 2L
+  )
+
+  # Step 3: Combine all and label 3 for everything else
+  labeled_all <- rbind(labeled_pos, labeled_neg)
+  full_labeled <- merge(candidates, labeled_all, by = c("peak_id", "gene_id"), all.x = TRUE)
+  full_labeled[is.na(label), label := 3L]
+
+  data.table::fwrite(full_labeled, output_file, sep = "\t")
+  message("Saved labeled training data to: ", output_file)
+  return(full_labeled)
+}
+
+training_ast <- label_peak_gene_pairs("Ast")
+training_OD <- label_peak_gene_pairs("OD")
+```
+# Subsetting to label 1/2 and chr123
+```{r}
+# 1. Load labeled data
+training_ast <- fread("data/eqtl_files/training_data_Ast_chr123.tsv.gz")
+used_peak_ids <- unique(training_ast[label %in% c(1, 2)]$peak_id)
+
+# 2. Load PeakMatrix and consensus peaks
+peak_mat <- readHDF5Array("data/combined_ATAC_peak_matrix.h5", name = "peaks")
+consensus_peaks <- readRDS("data/consensus_peak_set.rds")
+seqlevelsStyle(consensus_peaks) <- "UCSC"
+
+# 3. Compute center-based peak IDs to match
+peak_centers <- resize(consensus_peaks, width = 1, fix = "center")
+peak_ids_all <- paste0(seqnames(peak_centers), ":", start(peak_centers))
+
+# 4. Match to used peaks
+used_indices <- which(peak_ids_all %in% used_peak_ids)
+message("Subsetting to ", length(used_indices), " peaks (Ast, chr1–3, labeled only)")
+
+# 5. Subset PeakMatrix
+peak_mat_subset <- peak_mat[used_indices, ]
+
+# 6. Save smaller PeakMatrix
+writeHDF5Array(
+  peak_mat_subset,
+  filepath = "data/peak_matrix_chr123_Ast.h5",
+  name = "peaks"
+)
+
+```
+
