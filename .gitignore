@@ -1,0 +1,26 @@
+# Ignore large data files
+data/raw_data/
+data/*.h5
+data/*.rds
+data/*.RDS
+data/*.bed
+data/*.bed.gz
+data/*.tsv
+data/*.tsv.gz
+data/*.mtx
+data/*.loom
+data/*.parquet
+data/*.zip
+data/*.tar*
+data/*.gz
+data/*.idx
+
+# RStudio files
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# OS junk
+.DS_Store
+Thumbs.db
