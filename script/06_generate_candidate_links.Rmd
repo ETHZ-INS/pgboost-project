@@ -1,0 +1,112 @@
+---
+title: "06_generate_candidate_links.Rmd"
+author: "tobias"
+date: "2025-09-04"
+output: html_document
+---
+# 1. Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Signac)
+  library(GenomicRanges)
+  library(Matrix)
+  library(data.table)
+})
+
+SCRIPT_DIR <- getwd()   
+PROJECT_ROOT <- file.path(SCRIPT_DIR, "..")                     
+DATA_DIR      <- file.path(PROJECT_ROOT, "data")
+```
+
+# 2. Parameters
+```{r parameters}
+seurat_rds    <- file.path(DATA_DIR, "seo_RNA_ATAC_chr123.rds")
+celltype_col  <- "cell_type_manual"
+celltypes_tsv    <- file.path(DATA_DIR, "celltypes.tsv")
+window_bp     <- 500000L
+min_peak_frac <- 0.0
+min_gene_frac <- 0.0
+keep_chr      <- c("chr1","chr2","chr3")
+```
+
+# 3. Loop
+```{r}
+message("Reading cell types...")
+keys_df <- read.delim(celltypes_tsv, stringsAsFactors = FALSE, strip.white = TRUE)
+stopifnot("celltype_key" %in% names(keys_df))
+keys <- unique(trimws(keys_df$celltype_key))
+keys <- keys[!is.na(keys) & nzchar(keys)]
+if (!length(keys)) stop("No valid cell types found in ", celltypes_tsv)
+message("Will run for cell types: ", paste(keys, collapse = ", "))
+
+
+seo <- readRDS(seurat_rds)
+
+for (key in keys){
+  message("processing:", key)
+  stopifnot(celltype_col %in% colnames(seo[[]]))
+  cells_ct <- rownames(subset(seo, subset = !!as.name(celltype_col) == key)[[]])
+  if (length(cells_ct) == 0) stop("No cells found for cell type: ", key)
+  atac_counts <- GetAssayData(seo, assay = "ATAC", slot = "counts")[, cells_ct, drop = FALSE]
+  peak_ids    <- rownames(seo[["ATAC"]])
+  if (is.null(peak_ids) || length(peak_ids) == 0) stop("No peak rownames in ATAC assay.")
+  peak_gr     <- StringToGRanges(peak_ids, sep = c("-", "-"))
+  names(peak_gr) <- peak_ids
+  
+  if (!is.null(keep_chr)) {
+    peak_gr <- peak_gr[as.character(seqnames(peak_gr)) %in% keep_chr]
+    atac_counts <- atac_counts[rownames(atac_counts) %in% names(peak_gr), , drop = FALSE]
+  }
+  
+  rna_counts <- GetAssayData(seo, assay = "RNA", slot = "counts")[, cells_ct, drop = FALSE]
+  
+  peak_frac   <- Matrix::rowMeans(atac_counts > 0)
+  keep_peaks  <- names(peak_frac)[peak_frac >= min_peak_frac]
+  peaks_ct    <- peak_gr[keep_peaks]
+  
+  annot   <- Annotation(seo[["ATAC"]])
+  tss_gr  <- resize(annot, width = 1, fix = "start")
+  names(tss_gr) <- make.unique(sub("\\..*$","", mcols(annot)$gene_id))
+  if (!is.null(keep_chr)) tss_gr <- tss_gr[as.character(seqnames(tss_gr)) %in% keep_chr]
+  
+  gene_frac      <- Matrix::rowMeans(rna_counts > 0)
+  rna_ids        <- sub("\\..*$","", rownames(rna_counts))
+  keep_gene_ids  <- rna_ids[gene_frac >= min_gene_frac]
+  tss_ct         <- tss_gr[intersect(keep_gene_ids, names(tss_gr))]
+  
+  message("kept peaks: ", length(peaks_ct))
+  message("kept genes: ", length(tss_ct))
+  
+  tss_win <- resize(tss_ct, width = 2L*window_bp + 1L, fix = "center")
+  hits <- findOverlaps(peaks_ct, tss_win, ignore.strand = TRUE)
+  
+  if (!length(hits)) {
+    data.table::fwrite(data.table(), out_tsv, sep = "\t")
+    stop("No peak–gene pairs within ±", window_bp, " bp for ", key)
+  }
+  
+  Q <- queryHits(hits)
+  S <- subjectHits(hits)
+  res <- data.table::data.table(
+    cell_type  = key,
+    peak_id    = names(peaks_ct)[Q],
+    gene_id    = names(tss_ct)[S],
+    peak_chr   = as.character(GenomicRanges::seqnames(peaks_ct))[Q],
+    peak_start = GenomicRanges::start(peaks_ct)[Q],
+    peak_end   = GenomicRanges::end(peaks_ct)[Q],
+    gene_chr   = as.character(GenomicRanges::seqnames(tss_ct))[S],
+    tss        = GenomicRanges::start(tss_ct)[S]
+  )
+  
+  out_tsv <- file.path("output", "candidates", paste0("candidates_", key, ".tsv"))
+  dir.create(dirname(out_tsv), recursive = TRUE, showWarnings = FALSE)
+  
+  fwrite(res, out_tsv, sep = "\t")
+  message("Wrote candidates: ", out_tsv, " (", nrow(res), " rows)")
+}
+
+```
+

@@ -1,0 +1,262 @@
+---
+title: "05_seurat_preprocessing.Rmd"
+author: "tobiasmohl"
+date: "2025-07-16"
+output: html_document
+---
+
+# 1. Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+library(HDF5Array)
+library(zellkonverter)
+library(SummarizedExperiment)  
+library(SingleCellExperiment)
+library(sketchR)
+library(AnnotationHub)
+library(Signac)
+library(ensembldb)
+library(EnsDb.Hsapiens.v86)
+library(Seurat)
+library(GenomicRanges)
+library(GenomeInfoDb)})
+
+SCRIPT_DIR <- getwd()   
+PROJECT_ROOT <- file.path(SCRIPT_DIR, "..")                     
+DATA_DIR      <- file.path(PROJECT_ROOT, "data")
+```
+
+# 2. Load Files
+```{r}
+# Load objects you already have
+seo <- readRDS(file.path(DATA_DIR, "seo_annotated_paper.rds"))
+sce <- readRDS(file.path(PROJECT_ROOT, "data", "sce_filtered_proteincoding.rds"))
+consensus_peaks <- readRDS(file.path(DATA_DIR, "consensus_peak_set_chr123.rds"))
+PeakMatrix <- readH5AD(file.path(DATA_DIR, "peak_matrices/PeakMatrix-1-chr123.h5ad"))
+```
+
+# 3. Adapt Peak Matrix to workflow
+## rowranges
+```{r}
+# Extract peak names
+peak_names <- rownames(PeakMatrix)
+
+chr   <- sub("-.*", "", peak_names)
+start <- as.integer(sub(".*-(\\d+)-.*", "\\1", peak_names))
+end   <- as.integer(sub(".*-(\\d+)$", "\\1", peak_names))
+
+valid <- !(is.na(start) | is.na(end))
+
+# Create GRanges
+gr <- GRanges(
+  seqnames = chr[valid],
+  ranges = IRanges(start = start[valid], end = end[valid])
+)
+
+# Assign metadata
+mcols(gr) <- rowData(PeakMatrix)[valid, ]
+
+# Subset matrix
+PeakMatrix <- PeakMatrix[valid, ]
+
+# Now assign
+rowRanges(PeakMatrix) <- gr
+```
+
+## Build Peak names
+```{r}
+# Build rownames from GRanges coordinates
+peak_names <- paste0(
+  seqnames(rowRanges(PeakMatrix)),
+  "-",
+  start(rowRanges(PeakMatrix)),
+  "-",
+  end(rowRanges(PeakMatrix))
+)
+
+# Set as rownames
+rownames(PeakMatrix) <- peak_names
+```
+
+
+## Adapt ATAC names
+```{r}
+# Normalize ATAC names
+atac_names <- gsub(":", "_", colnames(PeakMatrix))
+#atac_names <- gsub("-1$", "_1", atac_names)
+
+# Set normalized names
+colnames(PeakMatrix) <- atac_names
+```
+
+# 4.Carry-over gene annotation from Single Cell Experiment
+```{r}
+GeneExpressionMatrix <- seo
+rdf <- as.data.frame(SummarizedExperiment::rowData(sce))
+stopifnot(all(c("ENSEMBL","SYMBOL","SEQNAME") %in% colnames(rdf)))
+
+# keep first non-NA entry per symbol
+rdf_sym <- rdf[!is.na(rdf$SYMBOL) & rdf$SYMBOL != "", c("SYMBOL","SEQNAME")]
+rdf_sym <- rdf_sym[!duplicated(rdf_sym$SYMBOL), ]
+
+norm_sym <- function(x) {
+  x <- toupper(trimws(x))
+  x <- gsub("^MT([A-Z0-9])", "MT-\\1", x)  # enforce MT- prefix
+}
+
+rna_assay <- "originalexp"
+rdf_sym$SYMBOL_N <- norm_sym(rdf_sym$SYMBOL)
+rna_feats        <- rownames(GeneExpressionMatrix[[rna_assay]])
+rna_feats_N      <- norm_sym(rna_feats)
+
+idx <- match(rna_feats_N, rdf_sym$SYMBOL_N)
+CHR <- rep(NA_character_, length(rna_feats_N))
+CHR[!is.na(idx)] <- as.character(rdf_sym$SEQNAME[idx[!is.na(idx)]])
+
+mf <- GeneExpressionMatrix[[rna_assay]]@meta.features
+if (is.null(mf) || nrow(mf) != length(rna_feats)) {
+  mf <- data.frame(row.names = rna_feats)
+}
+mf$SYMBOL <- rna_feats                    # keep original symbols
+mf$CHR    <- CHR
+GeneExpressionMatrix[[rna_assay]]@meta.features <- mf
+
+mapped <- sum(!is.na(CHR))
+cat(sprintf("Chromosomes annotated for %d / %d RNA features (%.1f%%).\n",
+            mapped, length(CHR), 100*mapped/length(CHR)))
+if (mapped < length(CHR)) {
+  unm <- head(rna_feats[is.na(CHR)], 15)
+  message("Examples unmapped: ", paste(unm, collapse = ", "))
+}
+```
+
+## Subsetting on chromosome 1, 2, and 3
+```{r}
+# filter GeneExpressionMatrix to genes on chr1–chr3
+gene_chromosomes <- GeneExpressionMatrix[[rna_assay]]@meta.features$CHR
+keep_genes <- gene_chromosomes %in% c("1", "2", "3")  
+GeneExpressionMatrix <- GeneExpressionMatrix[keep_genes, ]
+```
+
+## Intersecting Cells
+```{r}
+common_cells <- intersect(colnames(GeneExpressionMatrix), colnames(PeakMatrix))
+
+PeakMatrix <- PeakMatrix[, common_cells]
+GeneExpressionMatrix <- GeneExpressionMatrix[, common_cells]
+
+```
+# 5. Subsetting with sketchR (not performed for now)
+```{r}
+rd <- reducedDim(PeakMatrix, "X_spectral_harmony")
+idx_sketch <- sketchR::geosketch(reducedDim(PeakMatrix, "X_spectral_harmony"), N = , seed = 42)
+length(idx_sketch)
+
+PeakMatrix <- PeakMatrix[, idx_sketch]
+GeneExpressionMatrix <- GeneExpressionMatrix[, idx_sketch]
+```
+
+# 6. create Seurat Object
+```{r}
+rna_assay <- "originalexp"  
+
+# counts 
+rna_counts_sparse <- GetAssayData(GeneExpressionMatrix, assay = rna_assay, slot = "counts")
+if (!inherits(rna_counts_sparse, "dgCMatrix")) {
+  rna_counts_sparse <- as(rna_counts_sparse, "dgCMatrix")
+}
+
+atac_counts_sparse <- as(assay(PeakMatrix, "counts"), "dgCMatrix")
+
+# cell metadata (per cell)
+cell_metadata <- GeneExpressionMatrix@meta.data
+stopifnot(identical(rownames(cell_metadata), colnames(rna_counts_sparse)))
+
+# gene metadata (per feature)
+gene_metadata <- GeneExpressionMatrix[[rna_assay]]@meta.features
+stopifnot(identical(rownames(gene_metadata), rownames(rna_counts_sparse)))
+
+# Create Seurat object with RNA assay and cell metadata
+seurat_obj <- CreateSeuratObject(
+  counts = rna_counts_sparse,
+  assay = "RNA",
+  meta.data = cell_metadata
+)
+
+# Create and add ATAC assay
+peak_ranges <- rowRanges(PeakMatrix)
+atac_assay <- CreateChromatinAssay(
+  counts = atac_counts_sparse,
+  ranges = peak_ranges,
+  genome = "hg38"
+)
+seurat_obj[["ATAC"]] <- atac_assay
+
+src_chr <- GeneExpressionMatrix[["originalexp"]]@meta.features$CHR
+names(src_chr) <- rownames(GeneExpressionMatrix[["originalexp"]])
+
+# align to features present in the new object
+rna_feats_new <- Features(seurat_obj, assay = "RNA")
+src_chr <- src_chr[rna_feats_new]
+
+# add as feature-level metadata to the RNA assay (Assay5)
+seurat_obj[["RNA"]] <- AddMetaData(
+  object   = seurat_obj[["RNA"]],
+  metadata = src_chr,
+  col.name = "CHR"
+)
+
+md <- seurat_obj[["RNA"]]@meta.data
+rownames(md) <- Features(seurat_obj, "RNA")
+seurat_obj[["RNA"]]@meta.data <- md
+
+stopifnot(identical(rownames(seurat_obj[["RNA"]]@meta.data),
+                    Features(seurat_obj, "RNA")))
+
+attach_gene_annotation <- function(obj, genome = "hg38", keep_chrs = c("chr1","chr2","chr3")) {
+  suppressPackageStartupMessages(library(EnsDb.Hsapiens.v86))
+  edb <- EnsDb.Hsapiens.v86
+  gr  <- genes(edb, columns = c("gene_id","gene_name"))
+  gr  <- keepStandardChromosomes(gr, pruning.mode = "coarse")
+  old <- seqlevels(gr); new <- paste0("chr", sub("^MT$", "M", old)); names(new) <- old
+  gr  <- renameSeqlevels(gr, new)
+  if (!is.null(keep_chrs)) {
+    gr <- keepSeqlevels(gr, intersect(seqlevels(gr), keep_chrs), pruning.mode = "coarse")
+  }
+  GenomeInfoDb::genome(gr) <- genome
+
+  # ensure peaks carry same genome label
+  pr <- granges(obj[["ATAC"]])
+  GenomeInfoDb::genome(pr) <- genome
+  obj[["ATAC"]] <- SetAssayData(obj[["ATAC"]], slot = "ranges", new.data = pr)
+
+  # attach
+  Annotation(obj[["ATAC"]]) <- gr
+  obj
+}
+
+seurat_obj <- attach_gene_annotation(seurat_obj)
+
+# Add X_spectral_harmony embedding as a DimReduc object
+spec_embed <- as.matrix(reducedDim(PeakMatrix, "X_spectral_harmony"))
+rownames(spec_embed) <- colnames(PeakMatrix)
+
+spec_reduc <- CreateDimReducObject(
+  embeddings = spec_embed,
+  key = "SPEC_",
+  assay = "ATAC"
+)
+seurat_obj[["spectral"]] <- spec_reduc
+
+seurat_obj$leiden <- PeakMatrix$leiden[match(colnames(seurat_obj), colnames(PeakMatrix))]
+
+# Save fully annotated Seurat object
+saveRDS(seurat_obj, file.path(DATA_DIR, "seo_RNA_ATAC_chr123.rds"))
+```
+
+
+
+
+

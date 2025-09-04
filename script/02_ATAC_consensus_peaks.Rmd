@@ -1,0 +1,67 @@
+---
+title: "02_ATAC_consensus_peaks.Rmd"
+author: "tobiasmohl"
+date: "2025-08-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(GenomicRanges)
+  library(GenomeInfoDb)
+  library(rtracklayer)
+  library(data.table)
+})
+
+PROJECT_ROOT <- "/mnt/germain/work/tomohl/pgboost-project"
+DATA_DIR     <- file.path(PROJECT_ROOT, "data")
+RAW_DIR      <- file.path(DATA_DIR, "raw_data")
+dir.create(DATA_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# --- Parameters ---
+min_support <- 1L   # set to >=2 if you want peaks present in >=2 samples
+keep_style  <- "UCSC"
+keep_std    <- TRUE
+```
+
+# Consensus Peak
+```{r}
+peak_files <- list.files(
+  path = RAW_DIR,                                  
+  pattern = "atac_peaks\\.bed\\.gz$",
+  full.names = TRUE,
+  recursive = TRUE
+)
+stopifnot(length(peak_files) > 0)
+message(sprintf("Found %d peak files.", length(peak_files)))
+
+peak_list <- lapply(peak_files, function(f) {
+  gr <- rtracklayer::import(con = f, format = "BED")
+  GenomeInfoDb::seqlevelsStyle(gr) <- keep_style    
+  gr <- GenomeInfoDb::keepStandardChromosomes(gr, pruning.mode = "coarse")  
+  strand(gr) <- "*"                                  
+  mcols(gr)  <- NULL
+  gr[width(gr) > 0]
+})
+
+if (min_support <= 1L) {
+  consensus_peaks <- GenomicRanges::reduce(do.call(c, peak_list))
+} else {
+  grl   <- GenomicRanges::GRangesList(lapply(peak_list, GenomicRanges::reduce))
+  atoms <- GenomicRanges::disjoin(do.call(c, grl))
+  present_in <- vapply(grl, function(g) GenomicRanges::countOverlaps(atoms, g) > 0L,
+                       logical(length(atoms)))
+  support <- rowSums(present_in)
+  consensus_peaks <- GenomicRanges::reduce(atoms[support >= min_support])
+}
+
+consensus_peaks <- sort(consensus_peaks, ignore.strand = TRUE)
+cat(sprintf("Consensus peaks: %d | width median=%g bp\n",
+            length(consensus_peaks), median(width(consensus_peaks))))
+
+# save + export
+saveRDS(consensus_peaks, file = file.path(DATA_DIR, "consensus_peak_set.rds"))
+rtracklayer::export(consensus_peaks, file.path(DATA_DIR, "consensus_peaks.bed"))
+```

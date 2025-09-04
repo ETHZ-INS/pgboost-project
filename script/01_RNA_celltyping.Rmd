@@ -1,0 +1,525 @@
+---
+title: "01_rna_celltyping.Rmd"
+author: "tobiasmohl"
+date: "2025-07-24"
+output: html_document
+---
+# 1. Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+library(Seurat)
+library(scRNAseq)
+library(Signac)
+library(GenomeInfoDb)
+library(Matrix)
+library(ggplot2)
+library(SingleCellExperiment)
+library(data.table)
+library(pheatmap)
+library(viridis)
+library(scran)
+library(edgeR)
+library(scran)
+library(leidenAlg)
+library(HDF5Array) 
+library(ensembldb)
+library(EnsDb.Hsapiens.v86) 
+library(scater) 
+library(scDblFinder) 
+library(batchelor)
+library(matrixStats)
+library(harmony)
+library(tools)
+library(sechm)
+library(curl)
+library(AnnotationHub)
+library(AnnotationDbi)})
+
+SCRIPT_DIR <- getwd()   
+PROJECT_ROOT <- file.path(SCRIPT_DIR, "..")                     
+RAW_DIR      <- file.path(PROJECT_ROOT, "data", "raw_data")
+dir.create(RAW_DIR, recursive = TRUE, showWarnings = FALSE)
+```
+
+# 2. Download samples
+```{r GSM sample mapping and download}
+# GSM→Sample mapping 
+# If a TSV exists, we read it; otherwise fall back to the embedded data.frame.
+
+map_file <- file.path(PROJECT_ROOT, "data", "samples.tsv")
+if (file.exists(map_file)) {
+  samples <- fread(map_file)   # columns: GSM, sample
+} else {
+  samples <- data.table(
+    GSM=c("GSM5818649","GSM5818650","GSM5818651","GSM5818652","GSM5818653","GSM5818654","GSM5818655","GSM5818656","GSM5818657",
+          "GSM5818658","GSM5818659","GSM5818660","GSM5818661","GSM5818662","GSM5818663","GSM5818664","GSM5818665","GSM5818666",
+          "GSM5818667","GSM5818668","GSM5818669","GSM5818670","GSM5818671","GSM5818672","GSM5818673","GSM5818674","GSM5818675",
+          "GSM5818676","GSM5818677","GSM5818678","GSM5818679","GSM5818680","GSM5818681","GSM5818682"),
+    sample=c("C16007","C4176","C4322","C4361","C4634","C4660","C4691","C4814","C5410",
+             "P02284","P4205","P4560","P4653","P4772","P4884","P4919","P5318","P5331",
+             "P5626","P5662","P6259","P6320","P6323","P6326","YC4345","YC5276","YC5346",
+             "YC5442","YC5626","YC5751","YC5813","YC5928","YC6235","YC914")
+  )
+} 
+
+suffixes <- c("filtered_feature_bc_matrix.h5", "atac_fragments.tsv.gz", "atac_peaks.bed.gz")
+geo_url  <- function(gsm, sample, suffix){
+  sprintf("https://www.ncbi.nlm.nih.gov/geo/download/?acc=%s&format=file&file=%s_%s_%s",
+          gsm, gsm, sample, suffix)
+}
+
+download_one <- function(url, dest, retries=3){
+  for (i in seq_len(retries)){
+    ok <- tryCatch({
+      curl::curl_download(url, destfile = dest, quiet = FALSE)
+      file.exists(dest) && file.info(dest)$size > 0
+    }, error = function(e) FALSE)
+    if (ok) return(TRUE)
+    if (file.exists(dest)) unlink(dest)
+    Sys.sleep(2 * i)
+  }
+  FALSE
+}
+
+# Init manifest + counter 
+manifest <- vector("list", nrow(samples) * length(suffixes))
+k <- 0L
+
+# --- Download loop ---
+for (i in seq_len(nrow(samples))){
+  gsm    <- samples$GSM[i]
+  sample <- samples$sample[i]
+  outdir <- file.path(RAW_DIR, gsm)
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+  for (sfx in suffixes){
+    fn   <- sprintf("%s_%s_%s", gsm, sample, sfx)
+    url  <- geo_url(gsm, sample, sfx)
+    dest <- file.path(outdir, fn)
+
+    message(sprintf("→ %s", fn))
+    if (!download_one(url, dest)) {
+      warning(sprintf("Missing/empty: %s", fn))
+      next
+    }
+
+    k <- k + 1L
+    manifest[[k]] <- data.table(
+      GSM=gsm, sample=sample, file=fn, url=url,
+      bytes=file.info(dest)$size,
+      md5=unname(md5sum(dest))
+    )
+  }
+}
+
+# log
+if (k > 0L){
+  manifest_dt <- rbindlist(manifest[seq_len(k)], fill=TRUE)
+  man_path <- file.path(RAW_DIR, "download_manifest.tsv")
+  fwrite(manifest_dt, man_path, sep="\t")
+  message(sprintf("Done. %d files saved. Manifest: %s", k, man_path))
+} else {
+  message("No files were downloaded.")
+}
+```
+
+# 3. Combine samples
+## Subset to protein coding genes
+```{r}
+scefiles <- list.files(RAW_DIR, pattern = "filtered_feature_bc_matrix\\.h5$", recursive = TRUE, full.names = TRUE)
+sample_names <- basename(dirname(scefiles))  
+
+ensdb <- EnsDb.Hsapiens.v86::EnsDb.Hsapiens.v86
+g <- genes(ensdb)
+protein_coding_genes <- g$gene_id[g$gene_biotype == "protein_coding"]
+
+tenx_list <- lapply(seq_along(scefiles), function(i) {
+  m <- TENxMatrix(scefiles[[i]], group = "matrix")  
+  m <- m[rownames(m) %in% protein_coding_genes, ]
+  colnames(m) <- paste(sample_names[i], colnames(m), sep = "_")
+  as.matrix(m)  # load to memory
+})
+cm_combined <- do.call(cbind, tenx_list)
+sce <- SingleCellExperiment(assays = list(rna_counts = cm_combined))
+sce$Sample <- sub("_.*", "", colnames(sce))
+
+
+assayNames(sce, "rna_counts") <- "counts"
+
+sce_path <- file.path(PROJECT_ROOT, "data", "sce_full_proteincoding.rds")
+saveRDS(sce, file = sce_path)
+```
+
+# 4. Gene Annotation
+```{r}
+sce$Sample <- factor(sce$Sample)
+
+ensdb <- EnsDb.Hsapiens.v86::EnsDb.Hsapiens.v86
+ens_ids <- rownames(sce)
+
+rowData(sce)$ENSEMBL     <- ens_ids
+rowData(sce)$SYMBOL      <- mapIds(ensdb, keys = ens_ids,
+                                   keytype = "GENEID", column = "SYMBOL")
+rowData(sce)$SEQNAME     <- mapIds(ensdb, keys = ens_ids,
+                                   keytype = "GENEID", column = "SEQNAME")
+rowData(sce)$GENEBIOTYPE <- mapIds(ensdb, keys = ens_ids,
+                                   keytype = "GENEID", column = "GENEBIOTYPE")
+
+sym_safe <- ifelse(is.na(rowData(sce)$SYMBOL) | rowData(sce)$SYMBOL == "",
+                   rowData(sce)$ENSEMBL, rowData(sce)$SYMBOL)
+rownames(sce) <- uniquifyFeatureNames(rowData(sce)$ENSEMBL, sym_safe)
+```
+
+# 5. Quality Control
+## Low-Quality cells
+```{r}
+# identifying the mitochondrial transcripts
+mito_idx <- which(rowData(sce)$SEQNAME %in% c("MT","chrM","M","chrMT"))
+stats <- perCellQCMetrics(sce, subsets = list(Mt = mito_idx))
+batch <- factor(colData(sce)$Sample)
+
+qc <- quickPerCellQC(stats, percent_subsets = "subsets_Mt_percent", batch = batch)
+reasons <- perCellQCFilters(stats, sub.fields = "subsets_Mt_percent", batch = batch)
+colSums(as.matrix(reasons))
+summary(reasons$discard)
+attr(reasons$low_lib_size, "thresholds")
+attr(reasons$low_n_features, "thresholds")
+
+# Totals & barplot BEFORE filtering
+n_total      <- length(qc$discard)
+n_discarded  <- sum(qc$discard)
+counts <- c(Kept = n_total - n_discarded, Discarded = n_discarded)
+barplot(counts, col = c("darkgreen","tomato"),
+        ylab = "Number of cells",
+        main = "Overall QC Filtering (Kept vs Discarded)")
+
+```
+## Doublet Detection
+```{r}
+sce <- logNormCounts(sce)
+
+sce <- scDblFinder(sce, clusters = TRUE, samples = sce$Sample)
+
+sce <- sce[, sce$scDblFinder.class != "doublet" & sce$scDblFinder.score < 0.5]
+
+sce_path <- file.path(PROJECT_ROOT, "data", "sce_filtered_proteincoding.rds")
+saveRDS(sce, file = sce_path)
+```
+
+# 6. Celltyping
+## Marker Genes
+### Genes - Pierre Luc
+```{r}
+markerGenes <- list(
+  astrocytes = c("Aqp4", "Gfap", "Fgfr3","Dio2","Acsbg1","Sox9","Ndrg2","Aldh1l1","Slc1a2","Slc1a3"),
+  smooth_muscle = c("Tagln", "Cnn1", "Acta2", "Myl9", "Myh11"),
+  pericytes = c("Aspn", "Notch3", "Ndufa4l2", "Pdgfrb", "Higd1b"),  
+  endothelial = c("Cdh5","Flt1","Pecam1","Flt4","Abcg2","Vwf","Slc2a1","Bsg"),
+  microglia = c("C1qb","Tyrobp","P2ry12", "Csf1r", "Irf8"),
+  oligodendrocyte = c("Opalin","Plp1","Mag","Mog","Klk6","Mbp","Nipal4"),
+  OPC = c("Pdgfra","Sox6","Bcan","Neu4", "Fyn", "Tnr"),
+  COP = c("Fyn","Ust","Opcml","Tnr","Pcdh7","Enpp6"),
+  mural = c("Slc6a20a","Vtn","Colec12", "Arhgap29", "Zic1"),
+  PVM = c("Mrc1","F13a1","Dab2","Lyz2"),
+  other_vascular = c("Bnc2","Mgp"),
+  CR = c("Reln","Trp73"),
+  neuronal = c("Snap25", "Stmn2", "Syn1", "Rbfox3", "Dlg4", "Gabbr2","Grin2b","Grin1"),
+  neuronal_excitatory = c("Slc17a7","Slc17a6","Camk2a","Meis2","Neurod6","Nrn1"),
+  neuronal_inhibitory = c("Gad1","Gad2","Lhx6","Adarb2","Slc6a1","Pvalb","Sst","Sema3c","Slc32a1","Npy"),
+  neuroblast=c("Eomes", "Hopx", "Pou3f4","Ascl1", "Fabp7", "Nes", "Mki67"),
+  #cycling=c("Top2a","Cdc25c"),
+  others=c("Lamp5","Vip","Oxt","Oxtr","Chodl","Pax6","Sncg","Vipr2","Ntng1","Pax6","Nxph1","Ptprm")
+)
+
+geneMeta <- data.table(Symbol=rownames(rowData(sce)),
+                       ID=as.numeric(1:nrow(rowData(sce))))
+
+markerGenesTable <- data.table(Symbol=unlist(markerGenes, use.names=F),
+                           Type=rep(names(markerGenes), lengths(markerGenes)))
+markerGenesTable <- merge(markerGenesTable, geneMeta, by="Symbol", all.x=TRUE, suffixes="")
+```
+
+### Genes - Paper
+```{r}
+markerGenes <- list(
+  Neurons        = c("STMN2","TBR1"),
+  Oligodendrocytes = c("MBP","MOG"),
+  Astrocytes     = c("GFAP","AQP4"),
+  Microglia      = c("GPR34","TREM2","C1QC"),
+  OPC            = c("OLIG1","OLIG2"),
+  Endothelial    = c("FLT1","VWF","PDGFRB"),
+  Tcells         = c("CD3E","CD8A")
+)
+geneMeta <- data.table(Symbol=rownames(rowData(sce)),
+                       ID=as.numeric(1:nrow(rowData(sce))))
+
+markerGenesTable <- data.table(Symbol=unlist(markerGenes, use.names=F),
+                           Type=rep(names(markerGenes), lengths(markerGenes)))
+markerGenesTable <- merge(markerGenesTable, geneMeta, by="Symbol", all.x=TRUE, suffixes="")
+```
+
+## Seurat, Normalize, Scale, PCA
+```{r}
+seo <- as.Seurat(sce, counts = "counts", data = "logcounts")
+
+
+seo$Sample <- sce$Sample
+
+seo <- NormalizeData(seo)
+seo <- FindVariableFeatures(seo)
+seo <- ScaleData(seo)
+seo <- RunPCA(seo)
+
+seo_batch <- RunHarmony(seo, group.by.vars = "Sample", verbose = TRUE)
+
+sce_path <- file.path(PROJECT_ROOT, "data", "seo_filtered_proteincoding_harmony.rds")
+saveRDS(seo_batch, file = sce_path)
+```
+
+## Weigh PCA, Plot Clusters
+```{r}
+# extract PCA embeddings
+pca <- Embeddings(seo_batch, "harmony")
+qc_metric <- log10(seo_batch$nCount_originalexp + 1)
+
+# compute weights: penalize PCs correlated with QC
+wf <- 1 - (cor(pca[, 1:50], qc_metric))^2
+
+# apply weights
+pca_dense <- as.matrix(pca[, 1:50])
+pca_weighted <- sweep(pca_dense, 2, wf, `*`)
+
+# save as new reduction
+seo_batch[["merged_harmony_PCA"]] <- CreateDimReducObject(
+  embeddings = pca_weighted,
+  key = "mpca_",
+  assay = Assays(seo_batch)
+)
+
+# run UMAP on the weighted PCA
+seo_batch <- RunUMAP(seo_batch, reduction = "merged_harmony_PCA", dims = 1:50, reduction.name = "merged_UMAP")
+
+# find neighbors and clusters based on merged PCA
+seo_batch <- FindNeighbors(seo_batch, reduction = "merged_harmony_PCA", dims = 1:50, graph.name = "merged_PCA_snn")
+seo_batch <- FindClusters(seo_batch, resolution = 4.5, group.singletons = FALSE,
+                    algorithm = 4, random.seed = 1, graph.name = "merged_PCA_snn")
+
+# set cluster identities
+Idents(seo_batch) <- seo_batch$seurat_clusters
+
+# UMAP plot
+DimPlot(seo_batch, reduction = "merged_UMAP", label = TRUE) +
+  ggtitle("Clusters (QC-weighted PCA)")
+
+```
+
+```{r}
+seo <- seo_batch
+sce <- as.SingleCellExperiment(seo, assay = "originalexp")
+
+# Align by cell names before copying anything
+stopifnot(identical(sort(colnames(seo)), sort(colnames(sce))))
+ord <- match(colnames(sce), colnames(seo))
+
+# Transfer cluster and key metadata (aligned!)
+sce$cluster         <- seo$seurat_clusters[ord]
+colData(sce)$Sample <- seo$Sample[ord]
+colData(sce)$nUMI   <- seo$nCount_originalexp[ord]
+colData(sce)$nGene  <- seo$nFeature_originalexp[ord]
+colData(sce)$doublet_class <- seo$scDblFinder.class[ord]
+
+# Transfer reductions with alignment
+emb_umap <- Embeddings(seo, "merged_UMAP")
+emb_pca  <- Embeddings(seo, "merged_harmony_PCA")
+emb_umap <- emb_umap[match(colnames(sce), rownames(emb_umap)), , drop=FALSE]
+emb_pca  <- emb_pca [match(colnames(sce), rownames(emb_pca )), , drop=FALSE]
+
+reducedDim(sce, "merged_UMAP")       <- emb_umap
+reducedDim(sce, "merged_harmony_PCA")<- emb_pca
+```
+
+## Aggregate cells
+```{r}
+sce_agg <- scuttle::aggregateAcrossCells(
+  sce,
+  ids = sce$cluster,
+  use.assay.type = "counts",
+  statistics = "sum"
+)
+
+rowData(sce_agg)$SYMBOL <- rownames(sce_agg)
+rowData(sce_agg)$SYMBOL_UPPER <- toupper(rowData(sce_agg)$SYMBOL)
+
+# TMM -> CPM
+dge <- DGEList(counts = SummarizedExperiment::assay(sce_agg, "counts"))
+dge <- calcNormFactors(dge)
+SummarizedExperiment::assays(sce_agg)$cpm <- cpm(dge, log = FALSE)
+
+# Per-gene 0–1 scaling (avoid divide-by-zero)
+den <- pmax(rowMaxs(SummarizedExperiment::assays(sce_agg)$cpm), .Machine$double.eps)
+SummarizedExperiment::assays(sce_agg)$scaled_cpm <- sweep(SummarizedExperiment::assays(sce_agg)$cpm, 1, den, "/")
+```
+
+## Heatmap
+```{r}
+# 1) Prepare marker table (uppercase)
+markerGenes_upper <- toupper(unlist(markerGenes, use.names = FALSE))
+marker_df <- data.table(
+  Symbol = markerGenes_upper,
+  Type   = rep(names(markerGenes), lengths(markerGenes))
+)
+marker_df <- unique(marker_df, by = "Symbol")
+
+# 2) Pick rows present in aggregated object
+keep_idx <- which(rowData(sce_agg)$SYMBOL_UPPER %in% marker_df$Symbol)
+if (length(keep_idx) == 0L) stop("None of the marker genes were found in sce_agg.")
+
+# 3) Extract matrix (scaled CPM) and set readable rownames
+stopifnot("scaled_cpm" %in% assayNames(sce_agg))
+mat <- assays(sce_agg)$scaled_cpm[keep_idx, , drop = FALSE]
+rownames(mat) <- rowData(sce_agg)$SYMBOL_UPPER[keep_idx]
+
+# 4) Build row annotation aligned to mat
+marker_aln <- marker_df[match(rownames(mat), marker_df$Symbol)]
+annoRow <- data.frame(type = marker_aln$Type, row.names = rownames(mat))
+
+# 5) Order rows by marker type for nicer display
+ord <- order(annoRow$type)
+mat_ord <- mat[ord, , drop = FALSE]
+annoRow_ord <- annoRow[ord, , drop = FALSE]
+
+# 6) Plot
+pheatmap(
+  mat_ord,
+  annotation_row = annoRow_ord,
+  color = viridis(30),
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  show_colnames = TRUE,
+  fontsize_row = 7,
+  fontsize_col = 10,
+  main = "Scaled CPM of Marker Genes by Cluster"
+)
+```
+
+## Manual Annotations - Pierre Luc - Specific
+```{r}
+manual_annotation <- list(
+  astrocytes = c("20", "29", "42"),
+  #COP = c(),
+  #CR = c(),
+  endothelial = c("52"),
+  microglia = c("18","22", "38", "40", "51"),
+  mural = c("44"),
+  neuroblast = c("43"),
+  neuronal = c("34", "39", "46"),
+  neuronal_excitatory = c(),
+  neuronal_inhibitory = c("30"),
+  oligodendrocyte = c("2","3","4","5","6","7","8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "19", "21","23", "24", "25", "26", "27", "28", "32", "33", "35", "41"),
+  OPC = c("1", "37", "50"),
+  #other_vascular = c(),
+  others = c("31", "36", "48"),  
+  pericytes = c("45", "49"),
+  PVM = c("47")
+  #smooth_muscle = c()
+)
+
+# cell type mapping dataframe 
+man_annot_df <- data.frame(
+  cluster = unlist(manual_annotation),
+  cell_type = rep(names(manual_annotation), sapply(manual_annotation, length)),
+  stringsAsFactors = FALSE
+)
+
+# annotate SCE object 
+sce$cell_type_manual <- sapply(sce$cluster, function(i) {
+  hit <- man_annot_df[man_annot_df$cluster == i, "cell_type"]
+  if (length(hit) > 0) hit[1] else NA
+})
+
+# transfer annotation to Seurat object 
+seo$cell_type_manual <- sce$cell_type_manual  # same cell order
+
+# save updated Seurat object
+saveRDS(seo, file = "/mnt/germain/work/tomohl/pgBoost-HumanData/data/seo_all_samples_proteincoding_annotated.rds")
+```
+
+## Manual Annotations - Broad
+```{r}
+broad_annotation <- list(
+  Ast = c("20", "29", "42"),                                   # astrocytes
+  End = c("52"),                                               # endothelial
+  MG  = c("18", "22", "38", "40", "51"),                       # microglia
+  OD  = c("2","3","4","5","6","7","8", "9", "10", "11",
+          "12", "13", "14", "15", "16", "17", "19", "21",
+          "23", "24", "25", "26", "27", "28", "32", "33",
+          "35", "41"),                                         # oligodendrocyte
+  OPC = c("1", "37", "50"),                                    # OPC
+  IN  = c("30"),                                               # inhibitory neurons
+  Ext = c("34", "39", "46"),                                   # excitatory neurons
+  Other = c("31", "36", "48", "43", "44", "45", "47", "49")    # mural, pericytes, neuroblast, others
+)
+# cell type mapping dataframe 
+man_annot_df <- data.frame(
+  cluster = unlist(broad_annotation),
+  cell_type = rep(names(broad_annotation), sapply(broad_annotation, length)),
+  stringsAsFactors = FALSE
+)
+
+# annotate SCE object 
+sce$cell_type_broad <- sapply(sce$cluster, function(i) {
+  hit <- man_annot_df[man_annot_df$cluster == i, "cell_type"]
+  if (length(hit) > 0) hit[1] else NA
+})
+
+# transfer annotation to Seurat object
+seo$cell_type_broad <- sce$cell_type_broad  # same cell order
+
+# save updated Seurat object 
+saveRDS(seo, file = "/mnt/germain/work/tomohl/pgBoost-HumanData/data/seo_all_samples_proteincoding_annotated_broad.rds")
+
+DimPlot(seo, group.by = "cell_type_broad", reduction = "merged_UMAP", label = TRUE, repel = TRUE) +
+  ggtitle("Broad Cell Type Annotation") +
+  theme_minimal()
+```
+
+## Manual Annotations - Paper
+```{r}
+manual_annotation <- list(
+  astrocytes = c("25", "46"),
+  endothelial = c("58"),
+  Microglia = c("1", "32", "60"),
+  Neurons = c("47", "52", "53", "56"),
+  Oligodendrocytes = c("3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "26", "27", "28", "29", "30", "31", "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "43", "44", "45","48", "49", "50", "51", "54", "55", "57"),
+  OPC = c("2", "24", "61", "62"),
+  Tcells = c("59"),
+  Other = ("63")
+)
+
+# cell type mapping dataframe 
+man_annot_df <- data.frame(
+  cluster = unlist(manual_annotation),
+  cell_type = rep(names(manual_annotation), sapply(manual_annotation, length)),
+  stringsAsFactors = FALSE
+)
+
+# annotate SCE object 
+sce$cell_type_manual <- sapply(sce$cluster, function(i) {
+  hit <- man_annot_df[man_annot_df$cluster == i, "cell_type"]
+  if (length(hit) > 0) hit[1] else NA
+})
+
+# transfer annotation to Seurat object 
+seo$cell_type_manual <- sce$cell_type_manual  # same cell order
+
+# save updated Seurat object
+sce_path <- file.path(PROJECT_ROOT, "data", "seo_annotated_paper.rds")
+saveRDS(seo, file = sce_path)
+```
+
+
+
+
+
