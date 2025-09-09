@@ -1,0 +1,188 @@
+---
+title: "10_DistanceToNearest_PeakCentric.Rmd"
+author: "tobiasmohl"
+date: "2025-09-08"
+output: html_document
+---
+
+# 1. Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(data.table)
+  library(dplyr)
+})
+
+set.seed(187)
+
+SCRIPT_DIR    <- getwd()
+PROJECT_ROOT  <- file.path(SCRIPT_DIR, "..")
+DATA_DIR      <- file.path(PROJECT_ROOT, "data")
+OUTPUT_DIR    <- file.path(PROJECT_ROOT, "output")
+CAND_DIR      <- file.path(OUTPUT_DIR, "candidates")
+OUT_SCORE_DIR <- file.path(OUTPUT_DIR, "feature_scores", "DistanceToNearest")
+dir.create(OUT_SCORE_DIR, recursive = TRUE, showWarnings = FALSE)
+```
+
+# 2. Parameters/Inputs
+```{r}
+seurat_rds     <- file.path(DATA_DIR, "seo_RNA_ATAC_chr123.rds")
+celltypes_tsv  <- file.path(DATA_DIR, "celltypes.tsv")
+
+min_gene_frac  <- 0.0   # set >0 to enable per-celltype gene detection filtering
+min_peak_frac  <- 0.0   # set >0 to enable per-celltype peak detection filtering
+celltype_col   <- "cell_type_manual"
+```
+
+# 3. Helpers
+```{r}
+# Compute distance-to-nearest rank score 
+score_candidates_dt <- function(dt) {
+  stopifnot(all(c("peak_id","gene_id","peak_start","peak_end","tss") %in% names(dt)))
+  # peak center (integer, ~ floor((start+end)/2))
+  dt[, peak_center := as.integer((peak_start + peak_end) %/% 2)]
+  # absolute distance to TSS
+  dt[, distance := abs(peak_center - tss)]
+  # nearest distance per peak
+  dt[, nearest_dist := min(distance), by = peak_id]
+  # gap >= 0
+  dt[, gap := pmax(distance - nearest_dist, 0L)]
+  # rank by gap within each peak (nearest=rank 1)
+  dt[, .rank := frank(gap, ties.method = "min"), by = peak_id]
+  dt[, .n     := .N, by = peak_id]
+  # linear rank → score in [0,1]
+  dt[, score_rank_peak := ifelse(.n > 1, 1 - (.rank - 1) / (.n - 1), 1)]
+  dt[]
+}
+
+# Finalize to exactly 3 columns (peak, gene, score)
+finalize_three_cols <- function(dt_scored) {
+  out <- dt_scored[, .(peak = peak_id, gene = gene_id, score = score_rank_peak)]
+  out <- out[!is.na(peak) & !is.na(gene) & nzchar(peak) & nzchar(gene)]
+  out[]
+}
+
+write_outputs_three <- function(df_three, outfile_prefix) {
+  tsv <- paste0(outfile_prefix, ".tsv")
+  data.table::fwrite(df_three, tsv, sep = "\t", quote = FALSE)
+  message("  Saved (3 cols): ", tsv)
+}
+```
+
+```{r}
+obj_all <- NULL
+use_filters <- (min_gene_frac > 0) || (min_peak_frac > 0)
+
+if (use_filters) {
+  message("Loading Seurat object for filtering...")
+  obj_all <- readRDS(seurat_rds)
+  stopifnot("ATAC" %in% names(obj_all@assays), "RNA" %in% names(obj_all@assays))
+  stopifnot(celltype_col %in% colnames(obj_all@meta.data))
+} else {
+  message("Skipping Seurat loading (no filters active).")
+}
+```
+
+```{r}
+message("Reading cell types...")
+keys_df <- read.delim(celltypes_tsv, stringsAsFactors = FALSE, strip.white = TRUE)
+stopifnot("celltype_key" %in% names(keys_df))
+keys <- unique(trimws(keys_df$celltype_key))
+keys <- keys[!is.na(keys) & nzchar(keys)]
+message("Will run for: ", paste(keys, collapse = ", "))
+
+for (key in keys) {
+  message("\n== ", key, " ==")
+  safe_key <- gsub("[^A-Za-z0-9._-]+", "_", key)
+  outfile_prefix <- file.path(OUT_SCORE_DIR, paste0("distanceToNearest_", safe_key))
+  status_file    <- file.path(OUT_SCORE_DIR, paste0("distanceToNearest_", safe_key, ".status.tsv"))
+
+  # 1) locate candidates file (use file.exists, not is.na)
+  cand_file <- file.path(CAND_DIR, paste0("candidates_", safe_key, ".tsv"))
+  if (!file.exists(cand_file)) {
+    warning("No candidates file found for '", key, "': ", cand_file)
+    write_outputs_three(data.frame(peak=character(), gene=character(), score=numeric()), outfile_prefix)
+    data.table::fwrite(data.frame(cell_type = key, n_rows = 0, note = "no_candidate_file"),
+                       status_file, sep = "\t")
+    next
+  }
+
+  message("  Candidates: ", cand_file)
+  dt <- data.table::fread(cand_file)
+
+  # 2) required columns
+  need <- c("cell_type","peak_id","gene_id","peak_chr","peak_start","peak_end","gene_chr","tss")
+  miss <- setdiff(need, names(dt))
+  if (length(miss)) stop("Missing required columns in ", cand_file, ": ", paste(miss, collapse = ", "))
+
+  # 3) keep only this cell type (case-insensitive)
+  dt <- dt[tolower(cell_type) == tolower(key)]
+
+  # 4) ensure integer coords + drop rows with missing coords  <<< ADD HERE
+  num_cols <- c("peak_start","peak_end","tss")
+  dt[, (num_cols) := lapply(.SD, as.integer), .SDcols = num_cols]
+  dt <- dt[!is.na(peak_start) & !is.na(peak_end) & !is.na(tss)]
+  if (!nrow(dt)) {
+    warning("No usable rows (missing coords) for '", key, "'.")
+    write_outputs_three(data.frame(peak=character(), gene=character(), score=numeric()), outfile_prefix)
+    data.table::fwrite(data.frame(cell_type = key, n_rows = 0, note = "no_valid_rows"),
+                       status_file, sep = "\t")
+    next
+  }
+
+  # 5) Optional Seurat-based filtering
+  if (use_filters) {
+    sel <- as.vector(obj_all[[celltype_col]][, 1]) == key
+    n_sel <- sum(sel, na.rm = TRUE)
+    message("  Cells in Seurat subset: ", n_sel)
+    if (n_sel == 0L) {
+      warning("  No cells for '", key, "'.")
+      write_outputs_three(data.frame(peak=character(), gene=character(), score=numeric()), outfile_prefix)
+      data.table::fwrite(data.frame(cell_type = key, n_rows = 0, note = "no_cells"),
+                         status_file, sep = "\t")
+      next
+    }
+
+    obj <- obj_all[, sel]
+    rna_counts  <- Seurat::GetAssayData(obj, assay = "RNA",  slot = "counts")
+    atac_counts <- Seurat::GetAssayData(obj, assay = "ATAC", slot = "counts")
+    if (inherits(rna_counts,  "dgCMatrix")) rna_counts  <- (rna_counts  > 0) * 1
+    if (inherits(atac_counts, "dgCMatrix")) atac_counts <- (atac_counts > 0) * 1
+
+    gene_frac  <- rowMeans(rna_counts  > 0)
+    peak_frac  <- rowMeans(atac_counts > 0)
+
+    keep_genes     <- rownames(rna_counts)[gene_frac  > min_gene_frac]
+    keep_peaks_ids <- rownames(atac_counts)[peak_frac > min_peak_frac]
+
+    message("  After filters: genes=", length(keep_genes), " peaks=", length(keep_peaks_ids))
+    dt <- dt[gene_id %in% keep_genes & peak_id %in% keep_peaks_ids]
+    if (!nrow(dt)) {
+      warning("  No rows after filtering for '", key, "'.")
+      write_outputs_three(data.frame(peak=character(), gene=character(), score=numeric()), outfile_prefix)
+      data.table::fwrite(data.frame(cell_type = key, n_rows = 0, note = "no_rows_after_filter"),
+                         status_file, sep = "\t")
+      next
+    }
+  }
+
+  # 6) score by distance-to-nearest (within-peak rank)
+  dt_scored <- score_candidates_dt(dt)
+
+  # 7) finalize and write
+  out3 <- finalize_three_cols(dt_scored)
+  write_outputs_three(out3, outfile_prefix)
+
+  data.table::fwrite(
+    data.frame(cell_type = key, n_rows = nrow(out3), note = "ok"),
+    status_file, sep = "\t"
+  )
+  message("  Done: ", nrow(out3), " rows.")
+}
+
+message("\nAll cell types processed. Outputs in: ", normalizePath(OUT_SCORE_DIR))
+
+```
+

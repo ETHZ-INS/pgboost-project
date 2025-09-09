@@ -168,7 +168,8 @@ if (!inherits(rna_counts_sparse, "dgCMatrix")) {
   rna_counts_sparse <- as(rna_counts_sparse, "dgCMatrix")
 }
 
-atac_counts_sparse <- as(assay(PeakMatrix, "counts"), "dgCMatrix")
+#atac_counts_sparse <- as(assay(PeakMatrix, "counts"), "dgCMatrix")
+atac_counts_sparse <- assay(PeakMatrix)
 
 # cell metadata (per cell)
 cell_metadata <- GeneExpressionMatrix@meta.data

@@ -16,9 +16,11 @@ suppressPackageStartupMessages({
   library(data.table)
 })
 
-SCRIPT_DIR <- getwd()   
-PROJECT_ROOT <- file.path(SCRIPT_DIR, "..")                     
-DATA_DIR      <- file.path(PROJECT_ROOT, "data")
+SCRIPT_DIR   <- getwd()
+PROJECT_ROOT <- file.path(SCRIPT_DIR, "..")
+DATA_DIR     <- file.path(PROJECT_ROOT, "data")
+OUT_DIR      <- file.path(PROJECT_ROOT, "output", "candidates")
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
 ```
 
 # 2. Parameters
@@ -69,7 +71,7 @@ for (key in keys){
   
   annot   <- Annotation(seo[["ATAC"]])
   tss_gr  <- resize(annot, width = 1, fix = "start")
-  names(tss_gr) <- make.unique(sub("\\..*$","", mcols(annot)$gene_id))
+  names(tss_gr) <- make.unique(sub("\\..*$","", mcols(annot)$gene_name))
   if (!is.null(keep_chr)) tss_gr <- tss_gr[as.character(seqnames(tss_gr)) %in% keep_chr]
   
   gene_frac      <- Matrix::rowMeans(rna_counts > 0)
@@ -84,7 +86,6 @@ for (key in keys){
   hits <- findOverlaps(peaks_ct, tss_win, ignore.strand = TRUE)
   
   if (!length(hits)) {
-    data.table::fwrite(data.table(), out_tsv, sep = "\t")
     stop("No peak–gene pairs within ±", window_bp, " bp for ", key)
   }
   
@@ -101,7 +102,7 @@ for (key in keys){
     tss        = GenomicRanges::start(tss_ct)[S]
   )
   
-  out_tsv <- file.path("output", "candidates", paste0("candidates_", key, ".tsv"))
+  out_tsv <- file.path(OUT_DIR, paste0("candidates_", key, ".tsv"))
   dir.create(dirname(out_tsv), recursive = TRUE, showWarnings = FALSE)
   
   fwrite(res, out_tsv, sep = "\t")

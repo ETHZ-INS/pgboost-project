@@ -1,0 +1,197 @@
+---
+title: "11_conservation_run.Rmd"
+author: "tobiasmohl"
+date: "2025-09-09"
+output: html_document
+---
+
+# 1. Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(Signac)
+  library(GenomicRanges)
+  library(GenomicScores)
+  library(phastCons100way.UCSC.hg38)
+  library(GenomeInfoDb)
+  library(readr)
+  library(dplyr)
+  library(tools)
+})
+
+set.seed(187)
+
+SCRIPT_DIR    <- getwd()
+PROJECT_ROOT  <- file.path(SCRIPT_DIR, "..")
+DATA_DIR      <- file.path(PROJECT_ROOT, "data")
+OUTPUT_DIR    <- file.path(PROJECT_ROOT, "output")
+CAND_DIR      <- file.path(OUTPUT_DIR, "candidates")
+OUT_SCORE_DIR <- file.path(OUTPUT_DIR, "feature_scores", "conservation")
+dir.create(OUT_SCORE_DIR, recursive = TRUE, showWarnings = FALSE)
+```
+
+
+# 2. Inputs/Parameters
+```{r}
+seurat_path   <- file.path(DATA_DIR, "seo_RNA_ATAC_chr123.rds")
+
+use_centerwin <- FALSE        # also compute a fixed window around peak center
+center_width  <- 200L         # total width if use_centerwin=TRUE (e.g. 200 = ±100 bp)
+
+DO_SCORING    <- FALSE
+DIST_SCALE_BP <- 200000L     
+```
+
+
+```{r}
+message("[1/3] Reading Seurat object: ", seurat_path)
+seurat_obj <- readRDS(seurat_path)
+
+# Peaks as GRanges
+peaks_gr <- granges(seurat_obj[["ATAC"]])
+
+# Align seqlevels styles to phastCons resource and trim to valid ranges
+phast <- phastCons100way.UCSC.hg38
+seqlevelsStyle(peaks_gr) <- seqlevelsStyle(phast)
+peaks_gr <- trim(peaks_gr)
+
+# Stable peak identifier: "chr-start-end"
+peaks_gr$peak_id <- paste0(seqnames(peaks_gr), "-", start(peaks_gr), "-", end(peaks_gr))
+
+message("[2/3] Computing conservation (phastCons100way) over full peak intervals...")
+cons_full <- gscores(phast, peaks_gr, scores.only = TRUE)
+
+# Robust extraction (DataFrame vs numeric vector)
+cons_vec <- if (is(cons_full, "DataFrame")) {
+  as.numeric(cons_full[["default"]])
+} else {
+  as.numeric(cons_full)
+}
+
+cons_df <- data.frame(
+  peak  = peaks_gr$peak_id,
+  score = cons_vec,
+  stringsAsFactors = FALSE
+)
+
+if (use_centerwin) {
+  message(sprintf("... also computing center-window conservation (width=%d bp)", center_width))
+  centers  <- resize(peaks_gr, width = 1,   fix = "center", ignore.strand = TRUE)
+  win      <- resize(centers,  width = center_width, fix = "center")
+  cons_win <- gscores(phast, win, scores.only = TRUE)
+  cons_df$score_center <- as.numeric(
+    if (is(cons_win, "DataFrame")) cons_win[["default"]] else cons_win
+  )
+}
+
+# Persist base table
+cons_file <- file.path(OUT_SCORE_DIR, "conservation_scores.tsv")
+write_tsv(cons_df, cons_file)
+message("[3/3] Wrote per-peak conservation table: ", cons_file,
+        " (", nrow(cons_df), " peaks)")
+
+
+```
+
+```{r}
+# ---- Helpers ----
+make_peak_id <- function(chr, start, end) paste0(chr, "-", start, "-", end)
+
+rescale01 <- function(x) {
+  rng <- range(x, na.rm = TRUE)
+  if (!is.finite(rng[1]) || !is.finite(rng[2]) || diff(rng) == 0) return(rep(0.5, length(x)))
+  (x - rng[1]) / diff(rng)
+}
+rank01 <- function(x, ties.method = "average") {
+  r <- rank(x, na.last = "keep", ties.method = ties.method)
+  if (all(is.na(r))) return(rep(NA_real_, length(x)))
+  (r - 1) / pmax(max(r, na.rm = TRUE) - 1, 1)
+}
+dist_decay <- function(d_bp, scale_bp = 200000) exp(-abs(d_bp) / scale_bp)
+
+annotate_and_score_one <- function(cand_path, cons_tbl, out_dir,
+                                   do_scoring = FALSE, dist_scale_bp = 200000L) {
+  nm <- basename(cand_path)
+  message(" - Annotating: ", nm)
+
+  cand <- read_tsv(cand_path, show_col_types = FALSE, progress = FALSE)
+
+  # Ensure peak_id
+  if (!"peak_id" %in% names(cand)) {
+    needed <- c("peak_chr","peak_start","peak_end")
+    if (!all(needed %in% names(cand))) {
+      stop(sprintf("File %s must have either 'peak_id' or columns: %s",
+                   nm, paste(needed, collapse=", ")))
+    }
+    cand <- cand %>% mutate(peak_id = make_peak_id(peak_chr, peak_start, peak_end))
+  }
+
+  # Join conservation: cons_tbl has (peak, score[, score_center])
+  x <- cand %>% left_join(cons_tbl, by = c("peak_id" = "peak"))
+
+  # Optional composite scoring if requested
+  if (do_scoring) {
+    # Choose link evidence if available (adjust to your columns as needed)
+    link_w <-
+      if ("link_score" %in% names(x)) {
+        rescale01(x$link_score)
+      } else if ("corr" %in% names(x)) {
+        rescale01(pmax(x$corr, 0))      # clip negatives for correlation-based evidence
+      } else if ("coaccess" %in% names(x)) {
+        rescale01(pmax(x$coaccess, 0))
+      } else {
+        rep(1, nrow(x))
+      }
+
+    # Distance prior if available
+    dist_w <-
+      if ("distance" %in% names(x)) {
+        dist_decay(x$distance, scale_bp = dist_scale_bp)
+      } else if (all(c("peak_start","gene_tss") %in% names(x))) {
+        dist_decay(x$peak_start - x$gene_tss, scale_bp = dist_scale_bp)
+      } else {
+        rep(1, nrow(x))
+      }
+
+    cons01 <- rank01(x$score)
+    final  <- cons01 * link_w * dist_w
+
+    x <- x %>%
+      mutate(
+        cons_rank01 = cons01,
+        link_weight = link_w,
+        dist_weight = dist_w,
+        final_score = final
+      )
+  }
+
+  # Output (keep original columns + new conservation fields)
+  out_file <- file.path(out_dir, paste0(file_path_sans_ext(nm),
+                                        if (do_scoring) "_scored.tsv" else "_with_conservation.tsv"))
+  write_tsv(x, out_file)
+  message("   -> Wrote: ", out_file, " (", nrow(x), " rows)")
+  invisible(out_file)
+}
+
+# ---- Run over all candidate files ----
+cand_files <- list.files(CAND_DIR, pattern = "^candidates_.*\\.tsv$", full.names = TRUE)
+
+if (length(cand_files) == 0L) {
+  message("No candidates_*.tsv files found in: ", CAND_DIR, "\nSkipping annotation.")
+} else {
+  message("Annotating ", length(cand_files), " candidate file(s) with conservation",
+          if (DO_SCORING) " and composite scoring" else "", "...")
+  out_paths <- lapply(
+    cand_files,
+    annotate_and_score_one,
+    cons_tbl      = cons_df,
+    out_dir       = OUT_SCORE_DIR,
+    do_scoring    = DO_SCORING,
+    dist_scale_bp = DIST_SCALE_BP
+  )
+  message("Done.")
+}
+
+```
+

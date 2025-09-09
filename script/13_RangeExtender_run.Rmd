@@ -1,0 +1,202 @@
+---
+title: "13_RangeExtender_run.Rmd"
+author: "tobiasmohl"
+date: "2025-09-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(Seurat); library(Signac)
+  library(universalmotif)
+  library(TFBSTools)
+  library(motifmatchr)
+  library(GenomicRanges); library(GenomeInfoDb)
+  library(SummarizedExperiment)
+  library(data.table)
+  library(Rsamtools)
+})
+
+set.seed(187)
+
+SCRIPT_DIR   <- getwd()
+PROJECT_ROOT <- file.path(SCRIPT_DIR, "..")
+DATA_DIR     <- file.path(PROJECT_ROOT, "data")
+OUTPUT_DIR   <- file.path(PROJECT_ROOT, "output")
+CAND_DIR     <- file.path(OUTPUT_DIR, "candidates")
+OUT_REX_DIR  <- file.path(OUTPUT_DIR, "feature_scores", "rex")
+dir.create(OUT_REX_DIR, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r}
+seurat_path     <- file.path(DATA_DIR, "seo_RNA_ATAC_chr123.rds")
+jaspar_txt_path <- file.path(DATA_DIR, "H13CORE_jaspar_format.txt")
+fa_gz           <- file.path(DATA_DIR, "Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz")
+fa              <- sub("\\.gz$", "", fa_gz)
+ensembl_url     <- "https://ftp.ensembl.org/pub/release-115/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz"
+
+pad <- 16L         # ±bp around peak center to extend
+p_cut <- 0.01      # motifmatchr p-value cutoff (positions)
+
+```
+
+```{r}
+fa    <- sub("\\.gz$", "", fa_gz)
+
+# URL (Ensembl release 115)
+url <- "https://ftp.ensembl.org/pub/release-115/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz"
+
+# Download if missing
+if (!file.exists(fa) && !file.exists(fa_gz)) {
+  message("Downloading GRCh38 primary assembly...")
+  download.file(url, destfile = fa_gz, mode = "wb")
+}
+
+# Decompress if needed
+if (!file.exists(fa) && file.exists(fa_gz)) {
+  message("Unzipping FASTA...")
+  R.utils::gunzip(fa_gz, overwrite = TRUE)
+}
+
+# Index if needed
+if (!file.exists(paste0(fa, ".fai"))) {
+  message("Indexing FASTA with Rsamtools...")
+  Rsamtools::indexFa(fa)
+}
+
+# Open genome
+genome <- FaFile(fa)
+```
+
+```{r}
+## load peaks and harmonize seqnames for Ensembl FaFile
+seo   <- readRDS(seurat_path)
+peaks <- granges(seo[["ATAC"]])
+peaks <- GenomeInfoDb::keepStandardChromosomes(peaks, pruning.mode = "coarse")
+GenomeInfoDb::seqlevelsStyle(peaks) <- "Ensembl"
+mcols(peaks)$peak_id <- rownames(seo[["ATAC"]])
+
+## read + merge LHX Grade-A motifs, convert to PFMatrix (for out="positions")
+motifs_all <- universalmotif::read_jaspar(jaspar_txt_path)
+ids <- if (!is.null(names(motifs_all))) names(motifs_all) else
+         vapply(motifs_all, function(m) m@name, "")
+motifs_lhx <- motifs_all[grep("^LHX.+\\.A$", ids)]
+stopifnot(length(motifs_lhx) > 0)
+
+rex_um  <- universalmotif::trim_motifs(universalmotif::merge_motifs(motifs_lhx))
+rex_pfm <- universalmotif::convert_motifs(rex_um, class = "TFBSTools-PFMatrix")
+
+build_LUT_from_positions <- function(peaks, pfm, genome, pad = 16L, p_cutoff = 0.01) {
+  # extend peaks and compute mid
+  ext <- resize(peaks, width(peaks) + 2L * pad, fix = "center")
+  mid <- start(ext) + (width(ext) - 1L) %/% 2L
+
+  # scan positions (once) on extended peaks
+  pos_list <- motifmatchr::matchMotifs(
+    pfm, ext, genome = genome, out = "positions", p.cutoff = p_cutoff
+  )
+  pos_gr <- pos_list[[1]]
+
+  # geometry table always exists
+  lut_geom <- data.table(
+    peak_id = mcols(peaks)$peak_id,
+    chr     = as.character(seqnames(ext)),   # Ensembl names: "1","2","X","MT"
+    mid     = as.integer(mid)
+  )
+
+  # if no hits at all, return zeroed scores
+  if (length(pos_gr) == 0L) {
+    LUT <- copy(lut_geom)[, `:=`(score_left = 0, score_right = 0)]
+    return(LUT[])
+  }
+
+  # attach peak_id & mid to hits
+  ov <- GenomicRanges::findOverlaps(pos_gr, ext, select = "first")
+  pos_gr$peak_id <- mcols(peaks)$peak_id[ov]
+  pos_gr$mid     <- as.integer(mid[ov])
+
+  # hits -> table, classify side relative to mid
+  pos_dt <- data.table(
+    peak_id   = pos_gr$peak_id,
+    motif_pos = GenomicRanges::start(pos_gr),
+    score     = S4Vectors::mcols(pos_gr)$score,
+    mid       = pos_gr$mid
+  )
+  pos_dt[, side := ifelse(motif_pos <= mid, "left", "right")]
+
+  # aggregate per-peak: take MAX per side (switch to mean() if you prefer)
+  lut_pos <- pos_dt[
+    , .(
+        score_left  = suppressWarnings(max(score[side == "left"],  na.rm = TRUE)),
+        score_right = suppressWarnings(max(score[side == "right"], na.rm = TRUE))
+      ),
+    by = peak_id
+  ]
+
+  # merge geometry and fill NAs with zero (peaks with no hits on a side)
+  LUT <- merge(lut_geom, lut_pos, by = "peak_id", all.x = TRUE)
+  LUT[is.na(score_left),  score_left := 0]
+  LUT[is.na(score_right), score_right := 0]
+  LUT[]
+}
+
+LUT <- build_LUT_from_positions(peaks, rex_pfm, genome, pad = pad, p_cutoff = p_cut)
+
+## ---- AREX-style scoring per link using LUT ----
+compute_arex_from_LUT <- function(cand, LUT) {
+  cand <- as.data.table(cand)
+
+  # normalize column names and chr style
+  if ("peak" %in% names(cand) && !"peak_id" %in% names(cand)) {
+    setnames(cand, "peak", "peak_id")
+  }
+  if ("gene_chr" %in% names(cand)) {
+    cand[, gene_chr := sub("^chr", "", gene_chr)]
+  }
+
+  # minimal columns required
+  req <- c("peak_id", "gene_chr", "tss")
+  miss <- setdiff(req, names(cand))
+  if (length(miss)) stop("Candidates missing columns: ", paste(miss, collapse = ", "))
+
+  DT <- merge(cand[, .(peak_id, gene_chr, tss)], LUT, by = "peak_id", all.x = TRUE)
+
+  # keep links on matching chromosome with valid geometry
+  DT <- DT[gene_chr == chr & !is.na(tss) & !is.na(mid)]
+
+  toward_is_right <- DT$tss > DT$mid
+  toward <- ifelse(toward_is_right, DT$score_right, DT$score_left)
+  away   <- ifelse(toward_is_right, DT$score_left,  DT$score_right)
+
+  DT[, rex_toward := toward]
+  DT[, rex_away   := away]
+  DT[, score_raw  := toward - away]
+  DT[, arex_score := (toward - away) / pmax(abs(toward), abs(away), 1e-6)]
+
+  # return one row per link with extras (keep more columns if you like)
+  DT[]
+}
+
+
+
+```
+```{r}
+cand_files <- list.files(CAND_DIR, pattern = "^candidates_.*\\.tsv$", full.names = TRUE)
+
+for (f in cand_files) {
+  message("Scoring ", f)
+  cand   <- fread(f)
+  scored <- compute_arex_from_LUT(cand, LUT)
+
+  out_path <- file.path(OUT_REX_DIR, paste0("scored_", basename(f)))
+  fwrite(scored, out_path, sep = "\t")
+  message("Wrote: ", out_path, " (", nrow(scored), " rows)")
+}
+
+```
+
+
+
+

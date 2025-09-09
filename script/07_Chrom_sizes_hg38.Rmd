@@ -1,0 +1,41 @@
+---
+title: "07_Chrom_sizes-hg38.Rmd"
+author: "tobiasmohl"
+date: "2025-07-28"
+output: html_document
+---
+
+# 1. Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(BSgenome.Hsapiens.UCSC.hg38)
+  library(GenomeInfoDb)
+})
+
+
+SCRIPT_DIR <- getwd()   
+PROJECT_ROOT <- file.path(SCRIPT_DIR, "..")                     
+DATA_DIR      <- file.path(PROJECT_ROOT, "data")
+```
+
+# 2. Parameters/Inputs
+```{r parameters}
+out <- file.path(DATA_DIR,"hg38.chrom.sizes")
+si <- seqinfo(BSgenome.Hsapiens.UCSC.hg38)
+```
+
+```{r}
+wanted <- c(paste0("chr", 1:22), "chrX", "chrY", "chrM")
+si <- keepStandardChromosomes(si, pruning.mode = "coarse")[wanted]
+
+# Write the 2-column file (no header)
+df <- data.frame(chr = names(seqlengths(si)),
+                 length = as.integer(seqlengths(si)))
+dir.create(dirname(out), recursive = TRUE, showWarnings = FALSE)
+write.table(df, out, sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+message("Wrote: ", out)
+```
+

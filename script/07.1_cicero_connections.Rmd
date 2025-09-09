@@ -1,0 +1,150 @@
+---
+title: "07.1_cicero_connections.Rmd"
+author: "tobiasmohl"
+date: "2025-09-04"
+output: html_document
+---
+
+# 1. Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(Signac)
+  library(Seurat)
+  library(monocle3)
+  library(monocle)
+  library(cicero)
+  library(scuttle)
+  library(Matrix)
+  library(dplyr)
+  library(Biobase)
+  library(VGAM)
+})
+
+SCRIPT_DIR <- getwd()   
+PROJECT_ROOT <- file.path(SCRIPT_DIR, "..")                     
+DATA_DIR      <- file.path(PROJECT_ROOT, "data")
+
+output_dir   <- file.path(PROJECT_ROOT, "output", "feature_scores", "cicero")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+# 2. Parameters/Inputs
+```{r}
+seurat_file  <- file.path(DATA_DIR, "seo_RNA_ATAC_chr123.rds")
+celltype_tsv <- file.path(DATA_DIR, "celltypes.tsv")
+genome_sizes <- file.path(DATA_DIR, "hg38.chrom.sizes")
+
+celltype_col <- "cell_type_manual"
+leiden_col   <- "leiden"
+```
+
+# 3. Main Function
+```{r}
+run_one_celltype <- function(obj_all, celltype_key, genome_sizes, output_dir) {
+  cat("\n===== Running:", celltype_key, "=====\n")
+  sel <- obj_all[[celltype_col]] == trimws(celltype_key)
+  if (!any(sel)) {
+    cat("No cells found — skipping.\n")
+    return(NULL)
+  }
+  obj <- obj_all[, sel]
+  
+  # ATAC -> cluster matrix
+  atac <- suppressWarnings(SeuratObject::GetAssayData(obj, assay = "ATAC", layer = "data"))
+  cluster_ids <- obj[[leiden_col]][, 1, drop = TRUE]
+  meta_counts <- scuttle::sumCountsAcrossCells(atac, cluster_ids)
+  expr_mat <- 1L * (SummarizedExperiment::assay(meta_counts, "sum") > 0)
+  
+  # valid peaks
+  peak_names <- rownames(expr_mat)
+  valid <- grepl("^chr[^:]+[-:]\\d+[-:]\\d+$", peak_names)
+  expr_mat <- expr_mat[valid, , drop = FALSE]
+  dash_names <- gsub(":", "-", rownames(expr_mat))
+  rownames(expr_mat) <- dash_names
+  parsed_coords <- strcapture(
+    "^chr(\\w+)-(\\d+)-(\\d+)$",
+    dash_names,
+    data.frame(chr = character(), bp1 = integer(), bp2 = integer(), stringsAsFactors = FALSE)
+  )
+  rownames(parsed_coords) <- dash_names
+  
+  # monocle3 CDS
+  cellinfo <- data.frame(cells = colnames(expr_mat), row.names = colnames(expr_mat))
+  peakinfo <- data.frame(peaks = dash_names, gene_short_name = dash_names, row.names = dash_names)
+  cds <- monocle3::new_cell_data_set(expr_mat, cell_metadata = cellinfo, gene_metadata = peakinfo)
+  cds <- cds[Matrix::rowSums(SummarizedExperiment::assay(cds, "counts")) != 0, ]
+  parsed_coords_aligned <- parsed_coords[rownames(cds), , drop = FALSE]
+  cds <- monocle3::detect_genes(cds)
+  cds <- monocle3::estimate_size_factors(cds)
+  cds <- monocle3::preprocess_cds(cds, method = "LSI")
+  cds <- monocle3::reduce_dimension(cds, reduction_method = "UMAP", preprocess_method = "LSI")
+  
+  # harmonize chr names
+  rd <- as.data.frame(SummarizedExperiment::rowData(cds))
+  rd <- cbind(rd, parsed_coords_aligned)
+  chrlen <- read.table(genome_sizes, col.names = c("chr","length"))
+  chr_has_chr <- any(grepl("^chr", chrlen$chr))
+  rd_has_chr  <- any(grepl("^chr", rd$chr))
+  if (chr_has_chr && !rd_has_chr) {
+    rd$chr <- paste0("chr", rd$chr)
+  } else if (!chr_has_chr && rd_has_chr) {
+    rd$chr <- sub("^chr", "", rd$chr)
+  }
+  SummarizedExperiment::rowData(cds) <- rd
+  
+  # monocle v2 CDS for cicero
+  fd <- new("AnnotatedDataFrame", data = as.data.frame(SummarizedExperiment::rowData(cds)))
+  pd <- new("AnnotatedDataFrame", data = as.data.frame(SummarizedExperiment::colData(cds)))
+  cicero_cds <- monocle::newCellDataSet(
+    SummarizedExperiment::assay(cds, "counts"),
+    phenoData = pd,
+    featureData = fd,
+    expressionFamily = VGAM::binomialff(),
+    lowerDetectionLimit = 0
+  )
+  umap <- SingleCellExperiment::reducedDims(cds)$UMAP
+  monocle::reducedDimA(cicero_cds) <- as.matrix(umap[colnames(cicero_cds), , drop = FALSE])
+  
+  # normalize exprs
+  cicero_cds <- monocle::detectGenes(cicero_cds, min_expr = 0.1)
+  cicero_cds <- cicero:::estimateSizeFactorsSimp(cicero_cds)
+  sf  <- Biobase::pData(cicero_cds)$Size_Factor
+  mat <- Biobase::exprs(cicero_cds)
+  mat_norm <- Matrix::t(Matrix::t(mat) / sf)
+  Biobase::exprs(cicero_cds) <- as.matrix(mat_norm)
+  
+  # run cicero
+  conns <- cicero::run_cicero(cicero_cds, genomic_coords = chrlen)
+  cat("Connections:", nrow(conns), "\n")
+  
+  # save
+  if (nrow(conns) > 0) {
+    out_file <- file.path(output_dir, paste0("cicero_connections_", celltype_key, ".tsv"))
+    write.table(conns[, c("Peak1", "Peak2", "coaccess")], out_file, sep = "\t", quote = FALSE, row.names = FALSE)
+    cat("Saved:", out_file, "\n")
+  }
+}
+```
+
+# 4. Run Main
+```{r}
+df <- read.delim(celltype_tsv, stringsAsFactors = FALSE)
+df$celltype_key <- trimws(df$celltype_key)
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+cat("Loading Seurat object once...\n")
+obj_all <- readRDS(seurat_file)
+
+for (celltype_key in df$celltype_key) {
+  tryCatch({
+    run_one_celltype(obj_all, celltype_key, genome_sizes, output_dir)
+  }, error = function(e) {
+    message("ERROR in ", celltype_key, ": ", conditionMessage(e))
+  })
+}
+
+cat("All done.\n")
+```
+

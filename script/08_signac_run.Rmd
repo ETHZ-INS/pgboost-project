@@ -1,0 +1,141 @@
+---
+title: "08_signac_run.Rmd"
+author: "tobiasmohl"
+date: "2025-09-05"
+output: html_document
+---
+
+# 1. Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Signac)
+  library(GenomicRanges)
+  library(GenomeInfoDb)
+  library(BSgenome.Hsapiens.UCSC.hg38)
+  library(data.table)
+  library(BiocParallel)
+  library(future)
+  library(EnsDb.Hsapiens.v86)
+})
+
+SCRIPT_DIR <- getwd()   
+PROJECT_ROOT <- file.path(SCRIPT_DIR, "..")                     
+DATA_DIR      <- file.path(PROJECT_ROOT, "data")
+OUTPUT_DIR <- file.path(PROJECT_ROOT, "output")
+
+output_dir   <- file.path(PROJECT_ROOT, "output", "feature_scores", "signac")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+# 2. Input
+```{r}
+seurat_path  <- file.path(DATA_DIR, "seo_RNA_ATAC_chr123.rds")
+celltype_tsv <- file.path(DATA_DIR, "celltypes.tsv")
+celltype_col <- "cell_type_manual"
+```
+
+# 3. Main Function
+```{r}
+run_linkpeaks_on_celltype <- function(
+    obj_all, geneCoords, celltype_key,
+    celltype_col = NULL,
+    output_dir   = NULL,
+    linkpeaks_args = list(
+      peak.assay       = "ATAC",
+      expression.assay = "RNA",
+      peak.slot        = "counts",
+      expression.slot  = "counts",
+      method           = "pearson",
+      distance         = 5e5,
+      min.distance     = NULL,
+      min.cells        = 10,
+      n_sample         = 200,
+      pvalue_cutoff    = 0.05,
+      score_cutoff     = 0.05,
+      gene.id          = FALSE,
+      verbose          = TRUE
+    )
+) {
+  key <- trimws(celltype_key)
+  cat("\n===== Running LinkPeaks for:", key, "=====\n")
+  
+  if (!(celltype_col %in% colnames(obj_all@meta.data))) {
+    stop("Metadata column '", celltype_col, "' not found in Seurat object.")
+  }
+  
+  sel <- as.vector(obj_all[[celltype_col]][, 1]) == key
+  n_sel <- sum(sel, na.rm = TRUE)
+  cat("  Cells in subset:", n_sel, "\n")
+  
+  safe_key <- gsub("[^A-Za-z0-9._-]+", "_", key)
+  outfile  <- file.path(output_dir, paste0("linked_peaks_", safe_key, ".tsv"))
+  
+  obj <- obj_all[, sel]
+  
+
+  rna_feats <- rownames(obj[["RNA"]])     # symbols
+  keep <- !is.na(geneCoords$gene_name) & (geneCoords$gene_name %in% rna_feats)
+  gc2  <- geneCoords[keep]
+
+  linked <- try({do.call(Signac::LinkPeaks, c(list(object=obj, gene.coords=gc2), linkpeaks_args))}, silent = TRUE)
+  links_slot <- linked[["ATAC"]]@links
+  out_df <- if (!is.null(links_slot)) {
+    as.data.frame(links_slot)[, c("peak","gene","score"), drop=FALSE]
+  } else {
+    data.frame(peak=character(), gene=character(), score=numeric())
+  }
+  
+  # Atomic write
+  tmpfile <- tempfile(pattern = paste0("linked_peaks_", safe_key, "_"),
+                      tmpdir = output_dir, fileext = ".tsv.tmp")
+  data.table::fwrite(out_df, tmpfile, sep = "\t", quote = FALSE)
+  ok <- file.rename(tmpfile, outfile); if (!ok) file.copy(tmpfile, outfile, overwrite = TRUE)
+  
+  cat(sprintf("  Saved: %s (n_links=%d)\n", outfile, nrow(out_df)))
+  invisible(outfile)
+}
+```
+
+# 4. Run
+```{r}
+cat("Reading Seurat object...\n")
+obj_all <- readRDS(seurat_path)
+anno <- Signac::Annotation(obj_all[["ATAC"]])
+stopifnot(inherits(anno, "GRanges"))
+
+if (!all(startsWith(seqlevels(anno), "chr"))) GenomeInfoDb::seqlevelsStyle(anno) <- "UCSC"
+common <- intersect(seqlevels(anno), seqlevels(obj_all[["ATAC"]]))
+anno <- GenomeInfoDb::keepSeqlevels(anno, common, pruning.mode = "coarse")
+anno <- GenomeInfoDb::keepStandardChromosomes(anno, pruning.mode = "coarse")
+
+geneCoords <- anno  
+
+cat("RegionStats + Annotation...\n")
+obj_all <- Signac::RegionStats(
+  object = obj_all,
+  genome = BSgenome.Hsapiens.UCSC.hg38,
+  assay  = "ATAC",
+  verbose = TRUE
+)
+
+# ------------------ Read cell types ------------------
+df <- read.delim(celltype_tsv, stringsAsFactors = FALSE, strip.white = TRUE)
+if (!"celltype_key" %in% names(df)) stop("<celltypes.tsv> must contain a column named 'celltype_key'.")
+keys <- trimws(enc2utf8(df$celltype_key))
+nkeys <- length(keys)
+
+cat("Running LinkPeaks sequentially for", nkeys, "cell types...\n")
+
+# ------------------ Loop over cell types ------------------
+for (i in seq_along(keys)) {
+  key <- keys[i]
+  cat(sprintf("\n[%d/%d] %s\n", i, nkeys, key))
+  run_linkpeaks_on_celltype(obj_all, geneCoords, key, celltype_col, output_dir = output_dir)
+}
+
+cat("\nAll cell types processed.\n")
+```
+

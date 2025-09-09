@@ -1,0 +1,116 @@
+---
+title: "07.2_cicero_run.Rmd"
+author: "tobiasmohl"
+date: "2025-09-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(GenomicRanges)
+})
+
+SCRIPT_DIR <- getwd()   
+PROJECT_ROOT <- file.path(SCRIPT_DIR, "..")                     
+DATA_DIR      <- file.path(PROJECT_ROOT, "data")
+OUTPUT_DIR <- file.path(PROJECT_ROOT, "output")
+
+output_dir   <- file.path(PROJECT_ROOT, "output", "feature_scores", "cicero")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r}
+input_folder <-  file.path(OUTPUT_DIR, "feature_scores", "cicero")
+promoter_peaks_bedfile <- file.path(DATA_DIR, "TSS_plusminus500bp.bed")
+```
+
+
+```{r}
+files <- list.files(input_folder, full.names = TRUE)
+files <- files[grep("connections", files)]
+
+for(f in files){
+  message("Processing:", f)
+  input_file <- f
+  input_folder <- dirname(input_file)
+  celltype <- sub("^cicero_connections_(.+)\\.tsv$", "\\1", basename(f))
+  
+  cicero <- read.table(input_file, sep = "\t", header = TRUE)
+  cicero <- cicero[complete.cases(cicero), ]
+  
+  # Extract midpoint of Peak1
+  cicero <- cicero %>%
+    mutate(
+      chr = sub("-.*", "", Peak1),
+      start = as.numeric(sub(".*-(\\d+)-.*", "\\1", Peak1)),
+      end = as.numeric(sub(".*-(\\d+)$", "\\1", Peak1)),
+      mid = round((start + end) / 2)
+    )
+  
+  # --- Load promoter BED file ---
+  promoter_peaks <- read.table(promoter_peaks_bedfile, sep = "\t", header = FALSE)
+  promoter_peaks <- promoter_peaks[, 1:4]
+  colnames(promoter_peaks) <- c("chr", "prom_start", "prom_end", "gene")
+  promoter_peaks <- promoter_peaks %>%
+    dplyr::filter(gene != "." & gene != "")
+  
+  # --- Create GRanges objects ---
+  promoters_gr <- GRanges(
+    seqnames = promoter_peaks$chr,
+    ranges = IRanges(start = promoter_peaks$prom_start, end = promoter_peaks$prom_end),
+    gene = promoter_peaks$gene
+  )
+  
+  cicero_gr <- GRanges(
+    seqnames = cicero$chr,
+    ranges = IRanges(start = cicero$mid, end = cicero$mid),
+    Peak1 = cicero$Peak1,
+    Peak2 = cicero$Peak2,
+    coaccess = cicero$coaccess
+  )
+  
+  ## 1) Normalize promoter seqnames to UCSC ("chr" prefix)
+  if (!all(startsWith(seqlevels(promoters_gr), "chr"))) {
+    new_map <- setNames(paste0("chr", seqlevels(promoters_gr)), seqlevels(promoters_gr))
+    promoters_gr <- renameSeqlevels(promoters_gr, new_map)
+  }
+  
+  ## 2) Keep only chromosomes present in both objects (you only have chr1–3 in cicero)
+  common <- intersect(seqlevels(cicero_gr), seqlevels(promoters_gr))
+  promoters_gr <- keepSeqlevels(promoters_gr, common, pruning.mode = "coarse")
+  
+  
+  
+  # --- Find overlaps: midpoints inside promoter regions ---
+  hits <- findOverlaps(cicero_gr, promoters_gr)
+  
+  
+  # --- Assemble result ---
+  matched <- data.frame(
+    Peak1 = mcols(cicero_gr)$Peak1[queryHits(hits)],
+    Peak2 = mcols(cicero_gr)$Peak2[queryHits(hits)],
+    coaccess = mcols(cicero_gr)$coaccess[queryHits(hits)],
+    gene = mcols(promoters_gr)$gene[subjectHits(hits)]
+  )
+  
+  # --- Final peak-gene links ---
+  pgl <- matched %>%
+    mutate(peak = Peak2, score = coaccess) %>%
+    dplyr::select(peak, gene, score) %>%
+    group_by(peak, gene) %>%
+    summarise(score = mean(score), .groups = "drop")
+  
+  # --- Save ---
+  outdir <- file.path(input_folder)
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+  
+  # inside your loop where `celltype` is a single value
+  outfile <- file.path(outdir, paste0("cicero_peak_gene_links_", celltype, ".tsv"))
+  write.table(pgl, outfile, sep = "\t", row.names = FALSE, quote = FALSE)
+  
+}
+```
+
