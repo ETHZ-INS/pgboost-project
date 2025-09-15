@@ -1,0 +1,464 @@
+---
+title: "X_xgBoost_inputs.Rmd"
+author: "tobiasmohl"
+date: "2025-09-11"
+output: html_document
+---
+
+# 1. Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(GenomicRanges)
+  library(Seurat)
+  library(Matrix)
+  library(AnnotationDbi)
+  library(EnsDb.Hsapiens.v86)
+})
+
+set.seed(187)
+
+SCRIPT_DIR   <- getwd()
+PROJECT_ROOT <- file.path(SCRIPT_DIR, "..")
+DATA_DIR     <- file.path(PROJECT_ROOT, "data")
+SCORE_DIR   <- file.path(PROJECT_ROOT, "output/feature_scores")
+OUT_DIR <- file.path(PROJECT_ROOT, "output/xgBoost_outputs")
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+```
+
+# 2. Inputs/Parameters
+```{r}
+seurat_rds   <- file.path(DATA_DIR, "seo_RNA_ATAC_chr123.rds")
+consensus_rds <- file.path(DATA_DIR, "consensus_peak_set.rds")
+consensus_bed <- file.path(DATA_DIR, "consensus_peaks.bed")
+
+tss_file      <- file.path(DATA_DIR, "TSS.txt.gz")
+snps_bed      <- file.path(DATA_DIR, "SNPs.bed.gz")
+celltypes_tsv <- file.path(DATA_DIR, "celltypes.tsv")
+celltype_col  <- "cell_type_manual"
+keep_chr <- c("chr1","chr2","chr3")
+
+# Output directory and filenames
+data_tsv_path <- file.path(OUT_DIR, "data.tsv")
+predictors_path <- file.path(OUT_DIR, "predictors.txt")
+dropdups_path <- file.path(OUT_DIR, "drop_duplicates.txt")
+
+keys_df <- read.delim(celltypes_tsv, stringsAsFactors = FALSE, strip.white = TRUE)
+col_key <- if ("celltype_key" %in% names(keys_df)) "celltype_key" else names(keys_df)[1]
+keys <- unique(trimws(keys_df[[col_key]]))
+labels <- keys[!is.na(keys) & nzchar(keys)]
+
+# Windows
+link_kb <- 500  # TSS ± 500 kb candidate window
+prom_kb <- 1    # TSS ± 1 kb promoter mask
+```
+
+# 3.  Feature Scores
+```{r}
+signac_files <- file.path(SCORE_DIR, "signac", paste0("linked_peaks_", labels, ".tsv"))
+scent_files  <- file.path(SCORE_DIR, "scent", paste0("scent_links_", labels, ".tsv"))
+cicero_files <- file.path(SCORE_DIR, "cicero", paste0("cicero_peak_gene_links_", labels, ".tsv"))
+
+tad_sum_files <- file.path(SCORE_DIR, "tad_scores/sum_tad_scores",          paste0("sum_boundary_sumScore_", labels, ".tsv"))
+tad_pyt_files <- file.path(SCORE_DIR, "tad_scores/pythagorean_tad_scores",  paste0("pythagorean_TAD_score_", labels, ".tsv"))
+tad_boundaries_files <- file.path(SCORE_DIR, "tad_scores/n_tad_boundaries_crossed",
+                                  paste0("n_boundaries_crossed_", labels, ".tsv"))
+
+conservation_files <- file.path(SCORE_DIR, "conservation",       paste0("conservation_", labels, ".tsv"))
+
+rex_files <- file.path(SCORE_DIR, "rex",                         paste0("scored_candidates_", labels, ".tsv"))
+
+atac_variance_files <- file.path(SCORE_DIR, "varianceATAC",      paste0("links_with_ATACvariance_", labels, ".tsv"))
+atac_mean_files <- file.path(SCORE_DIR, "meanATAC",      paste0("links_with_meanATAC_", labels, ".tsv"))
+
+predEnhancer_p_lin_score_files <- file.path(SCORE_DIR, "predEnhancer/poisson-linear/score", paste0("regularized_regression_poisson-linear-score_", labels, ".tsv"))
+predEnhancer_p_lin_beta_files <- file.path(SCORE_DIR, "predEnhancer/poisson-linear/beta",      paste0("regularized_regression_poisson-linear-score_", labels, ".tsv"))
+
+predEnhancer_p_exp_score_files <- file.path(SCORE_DIR, "predEnhancer/poisson-exp/score",      paste0("regularized_regression_poisson-exp-score_", labels, ".tsv"))
+predEnhancer_p_exp_beta_files <- file.path(SCORE_DIR, "predEnhancer/poisson-exp/beta",      paste0("regularized_regression_poisson-exp-score_", labels, ".tsv"))
+
+predEnhancer_g_lin_score_files <- file.path(SCORE_DIR, "predEnhancer/gaussian-linear/score",  paste0("regularized_regression_gaussian-linear-score_", labels, ".tsv"))
+predEnhancer_g_lin_beta_files <- file.path(SCORE_DIR, "predEnhancer/gaussian-linear/beta",      paste0("regularized_regression_gaussian-linear-score_", labels, ".tsv"))
+
+predEnhancer_g_exp_score_files <- file.path(SCORE_DIR, "predEnhancer/gaussian-exp/score",      paste0("regularized_regression_gaussian-exp-score_", labels, ".tsv"))
+predEnhancer_g_exp_beta_files <- file.path(SCORE_DIR, "predEnhancer/gaussian-exp/beta",      paste0("regularized_regression_gaussian-exp-score_", labels, ".tsv"))
+
+distNearest_peakCentric_files <- file.path(SCORE_DIR, "DistanceToNearest",      paste0("distanceToNearest_", labels, ".tsv"))
+
+```
+
+# 4. Helpers
+```{r}
+agg_fun <- function(x) if (all(is.na(x))) NA_real_ else max(x, na.rm = TRUE)
+
+stop_if_missing <- function(paths) {
+  miss <- paths[!file.exists(paths)]
+  if (length(miss)) stop("Missing files:\n - ", paste(miss, collapse = "\n - "))
+}
+
+normalize_feature_genes <- function(DT) {
+  if (is.character(DT)) DT <- fread(DT)
+  stopifnot(is.data.table(DT))
+  gene_col <- intersect(names(DT), c("gene","Gene","gene_id","symbol","SYMBOL","GeneSymbol","GENE"))
+  if (!length(gene_col)) stop("No gene column found. Columns: ", paste(names(DT), collapse=", "))
+  setnames(DT, gene_col[1], "gene", skip_absent = TRUE)
+  DT[, gene := trimws(as.character(gene))]
+  peak_col <- intersect(names(DT), c("peak","Peak","peak_id","peakID"))
+  if (!length(peak_col)) stop("No peak column found. Columns: ", paste(names(DT), collapse=", "))
+  setnames(DT, peak_col[1], "peak", skip_absent = TRUE)
+  unique(DT)
+}
+
+merge_left <- function(x, y, by) merge(x, y, by = by, all.x = TRUE, allow.cartesian = TRUE)
+
+looks_like_ensembl <- function(x) {
+  x <- na.omit(x)
+  if (!length(x)) return(FALSE)
+  mean(grepl("^ENSG\\d+", x)) > 0.5
+}
+
+map_ensembl_to_symbol <- function(ensembl_vec) {
+  tx <- AnnotationDbi::select(EnsDb.Hsapiens.v86,
+                              keys = unique(ensembl_vec),
+                              keytype = "GENEID",
+                              columns = c("SYMBOL"))
+  tx <- unique(tx[!is.na(tx$SYMBOL), c("GENEID","SYMBOL")])
+  setDT(tx); setkey(tx, GENEID)
+  map <- tx[.(unique(ensembl_vec)), SYMBOL]
+  names(map) <- unique(ensembl_vec)
+  map
+}
+
+# Pseudobulk logCPM with CPM = (1e6 * PB / lib), then log((1e6*PB + 1)/lib)
+pseudobulk_logCPM <- function(counts_mat, groups_factor) {
+  stopifnot(ncol(counts_mat) == length(groups_factor))
+  groups_factor <- droplevels(groups_factor)
+  
+  # sum counts per group (features x groups)
+  pb  <- Matrix::t(rowsum(Matrix::t(counts_mat), group = groups_factor))
+  lib <- Matrix::colSums(pb); lib[lib == 0] <- 1
+  val <- (pb * 1e6 + 1) %*% Diagonal(x = 1 / lib)  # ((1e6*PB + 1) / lib)
+  logv <- log(val)
+  DT <- as.data.table(as.matrix(logv), keep.rownames = "feature")
+  setnames(DT, c("feature", levels(groups_factor)))
+  melt(DT, id.vars = "feature",
+       variable.name = "celltype",
+       value.name = "logCPM",
+       variable.factor = FALSE)[]
+}
+```
+
+# 5. READ & FILTER BACKBONE
+```{R}
+message("Reading consensus peaks, TSS, and SNPs ...")
+stop_if_missing(c(consensus_rds, tss_file, snps_bed))
+
+consensus_peaks <- readRDS(consensus_rds)
+gr_peaks <- consensus_peaks
+
+# keep only chr1-3
+gr_peaks <- keepSeqlevels(gr_peaks, keep_chr, pruning.mode = "coarse")
+
+# --- IMPORTANT: add peak ID column ---
+mcols(gr_peaks)$peak <- sprintf("%s-%s-%s",
+                                as.character(seqnames(gr_peaks)),
+                                start(gr_peaks),
+                                end(gr_peaks))
+
+
+# keep only desired chromosomes and build the string IDs
+gr_peaks <- keepSeqlevels(gr_peaks, keep_chr, pruning.mode = "coarse")
+peaks <- data.table(
+  chr   = as.character(seqnames(gr_peaks)),
+  start = as.integer(start(gr_peaks)),
+  end   = as.integer(end(gr_peaks))
+)
+peaks[, peak := sprintf("%s-%s-%s", chr, start, end)]
+
+
+# TSS (file has numeric chr; convert and filter to chr1-3)
+tss <- fread(tss_file)
+if (!all(c("chr","tss","gene") %in% names(tss))) {
+  stop("TSS file must contain columns: chr, tss, gene")
+}
+tss[, chr := paste0("chr", chr)]
+tss <- tss[chr %in% keep_chr]
+gr_tss <- GRanges(tss$chr, IRanges(tss$tss, tss$tss), gene = tss$gene)
+
+gr_link <- promoters(gr_tss, upstream = link_kb*1000, downstream = link_kb*1000)
+mcols(gr_link)$gene <- mcols(gr_tss)$gene
+gr_prom <- promoters(gr_tss, upstream = prom_kb*1000, downstream = prom_kb*1000)
+mcols(gr_prom)$gene <- mcols(gr_tss)$gene
+
+message("Computing peak–gene candidates in ±", link_kb, " kb (excluding ±", prom_kb, " kb promoters) ...")
+ov_link <- findOverlaps(gr_peaks, gr_link, ignore.strand = TRUE)
+cand <- unique(data.table(
+  peak = mcols(gr_peaks)$peak[queryHits(ov_link)],
+  gene = mcols(gr_link)$gene [subjectHits(ov_link)]
+))
+
+ov_prom <- findOverlaps(gr_peaks, gr_prom, ignore.strand = TRUE)
+peaks_in_prom <- unique(mcols(gr_peaks)$peak[queryHits(ov_prom)])
+cand <- cand[!peak %in% peaks_in_prom]
+
+# peak–gene distance (midpoint vs TSS), safety filter < link_kb
+peaks_key <- peaks[, .(peak, chr, start, end)][, mid := (start + end) %/% 2L]
+tss_key   <- tss  [, .(gene, chr, tss)]
+setkey(peaks_key, peak)
+setkey(tss_key, gene, chr)
+
+cand <- merge(cand, peaks_key[, .(peak, mid, chr)], by = "peak", all.x = TRUE)
+cand <- merge(cand, tss_key [, .(gene, chr, tss)], by = c("gene","chr"), all.x = TRUE)
+cand[, peak_gene_distance := abs(mid - tss)]
+cand <- cand[peak_gene_distance < link_kb*1000]
+cand[, c("mid","tss","chr") := NULL]
+
+# SNPs (filter to chr1-3)
+snps <- fread(snps_bed, col.names = c("chr","start","end"))
+snps[, `:=`(chr = as.character(chr), start = as.integer(start), end = as.integer(end))]
+snps <- snps[chr %in% keep_chr]
+snps[, snp := sprintf("%s-%s-%s", chr, start, end)]
+gr_snps <- GRanges(snps$chr, IRanges(snps$start, snps$end))
+
+message("Expanding peaks to overlapping SNPs ...")
+ov_ps <- findOverlaps(gr_peaks, gr_snps, ignore.strand = TRUE)
+peak_snp <- unique(data.table(
+  peak = mcols(gr_peaks)$peak[queryHits(ov_ps)],
+  snp  = snps$snp            [subjectHits(ov_ps)]
+))
+
+# Backbone: (snp, peak, gene, peak_gene_distance)
+features <- merge(peak_snp, cand, by = "peak", allow.cartesian = TRUE)
+setcolorder(features, c("snp","peak","gene","peak_gene_distance"))
+```
+
+# 6.  Merge Feature scores
+```{r}
+method_specs <- list(
+  list(paths = signac_files,         score_col = "score",    out = "signac"),
+  list(paths = scent_files,          score_col = "beta",     out = "scent"),
+  list(paths = cicero_files,         score_col = "score",    out = "cicero"),
+  list(paths = tad_sum_files,        score_col = "score",    out = "tad_sum_score"),
+  list(paths = tad_pyt_files,        score_col = "score",    out = "tad_pyt_score"),
+  list(paths = tad_boundaries_files, score_col = "score",    out = "tad_n_boundaries"),
+  list(paths = conservation_files,   score_col = "score",    out = "conservation"),
+  list(paths = rex_files,            score_col = "score",    out = "rex"),
+  list(paths = atac_variance_files,  score_col = "var_atac", out = "ATACvariance"),
+  list(paths = atac_mean_files,  score_col = "mean_atac", out = "ATACmean"),
+  list(paths = predEnhancer_p_lin_score_files,  score_col = "score", out = "predEnhancer_p_lin_score"),
+  list(paths = predEnhancer_p_lin_beta_files,  score_col = "beta", out = "predEnhancer_p_lin_beta"),
+  list(paths = predEnhancer_p_exp_score_files,  score_col = "score", out = "predEnhancer_p_exp_score"),
+  list(paths = predEnhancer_p_exp_beta_files,  score_col = "beta", out = "predEnhancer_p_exp_beta"),
+  list(paths = predEnhancer_g_lin_score_files,  score_col = "score", out = "predEnhancer_g_lin_score"),
+  list(paths = predEnhancer_g_lin_beta_files,  score_col = "beta", out = "predEnhancer_g_lin_beta"),
+  list(paths = predEnhancer_g_exp_score_files,  score_col = "score", out = "predEnhancer_g_exp_score"),
+  list(paths = predEnhancer_g_exp_beta_files,  score_col = "beta", out = "predEnhancer_g_exp_beta"),
+  list(paths = distNearest_peakCentric_files,  score_col = "score", out = "distNearest_peakCentric"))
+
+if (!all(lengths(lapply(method_specs, `[[`, "paths")) == length(labels))) {
+  stop("Every method spec must have one file per label.")
+}
+
+read_method <- function(path, score_col, out_name, label) {
+  if (!file.exists(path)) {
+    message("Skipping missing file: ", path)
+    return(NULL)
+  }
+  DT <- normalize_feature_genes(fread(path))
+  if (!(score_col %in% names(DT))) {
+    stop(sprintf("Column '%s' not found in %s. Available: %s",
+                 score_col, path, paste(names(DT), collapse=", ")))
+  }
+  setnames(DT, score_col, out_name)
+  DT <- DT[, .(peak, gene, val = get(out_name))]
+  setnames(DT, "val", sprintf("%s_%s", out_name, label))
+
+  # diagnostics: how many overlap with features?
+  common_peaks <- length(intersect(DT$peak, features$peak))
+  common_genes <- length(intersect(DT$gene, features$gene))
+  message(sprintf("[%s-%s] peaks overlap: %d, genes overlap: %d, rows: %d",
+                  out_name, label, common_peaks, common_genes, nrow(DT)))
+
+  DT[, lapply(.SD, agg_fun), by = .(peak, gene)]
+}
+
+
+message("Merging method scores ...")
+for (i in seq_along(labels)) {
+  lab <- labels[i]
+  for (ms in method_specs) {
+    mm <- read_method(ms$paths[i], ms$score_col, ms$out, lab)
+    if (!is.null(mm)) {
+      # after merge, report how many non-NA values were added
+      before <- ncol(features)
+      features <- merge_left(features, mm, by = c("peak","gene"))
+      new_col <- setdiff(names(features), names(features)[1:(before)])
+      if (length(new_col) == 1) {
+        message(sprintf(" -> Added column %s, non-NA = %d",
+                        new_col, sum(!is.na(features[[new_col]]))))
+      }
+    }
+  }
+}
+# snp->chr and distances to TSS (closest flag)
+snps_mid <- snps[, .(snp, chr, mid = start)]
+features <- merge_left(features, snps_mid, by = "snp")
+features <- merge_left(features, tss[, .(gene, chr, tss)], by = c("gene","chr"))
+features[, snp_gene_distance := abs(mid - tss)]
+features[, c("mid","tss") := NULL]
+
+setorder(features, snp, snp_gene_distance)
+closest <- features[, .SD[1L], by = snp][, .(snp, gene)]
+closest[, closest_tss := 1L]
+features <- merge_left(features, closest, by = c("snp","gene"))
+features[is.na(closest_tss), closest_tss := 0L]
+features[, chr := tstrsplit(snp, "-", fixed = TRUE, keep = 1L)]
+
+```
+
+# 7. Reshape to Wide
+```{r}
+score_suffixes <- paste0("_(", paste(labels, collapse="|"), ")$")
+score_cols_all <- grep(score_suffixes, names(features), value = TRUE)
+
+id_cols <- c("snp","gene","peak","snp_gene_distance","peak_gene_distance","closest_tss","chr")
+long <- melt(
+  features,
+  id.vars      = intersect(id_cols, names(features)),
+  measure.vars = score_cols_all,           # only columns that end with _<label>
+  variable.name = "score_cell",
+  value.name    = "value",
+  variable.factor = FALSE
+)
+
+# Keep a copy for diagnostics
+long[, score_cell_raw := score_cell]
+
+# Extract the last token as putative celltype
+long[, celltype := sub("^.*_", "", score_cell_raw)]
+
+# Compute 'score' by stripping ONLY a trailing _<label>
+ct_tail_pat <- paste0("_(?:", paste(labels, collapse="|"), ")$")
+long[, score := sub(ct_tail_pat, "", score_cell_raw, perl = TRUE)]
+
+# Drop anything whose tail isn't a real celltype (fixes 'g-exp-beta', 'g', 'n', etc.)
+bad <- long[!celltype %chin% labels, unique(score_cell_raw)]
+if (length(bad)) {
+  warning("Dropping columns without a valid celltype suffix: ",
+          paste(utils::head(bad, 10), collapse = ", "),
+          if (length(bad) > 10) paste0(" ... (", length(bad)-10, " more)"))
+}
+long <- long[celltype %chin% labels]
+
+# Clean up
+long[, c("score_cell","score_cell_raw") := NULL]
+
+# Cast to wide: one row per (snp, gene, peak, celltype, ...) and one column per 'score'
+flat <- dcast(
+  long,
+  snp + gene + peak + celltype + snp_gene_distance + peak_gene_distance + closest_tss + chr ~ score,
+  value.var = "value",
+  fun.aggregate = agg_fun
+)
+
+# Base columns first
+base_cols <- c("snp","gene","peak","celltype","snp_gene_distance","peak_gene_distance","closest_tss","chr")
+score_cols <- setdiff(names(flat), base_cols)
+setcolorder(flat, c(base_cols, score_cols))
+stopifnot(length(score_cols) > 0L)
+# Sanity: celltypes should be exactly from 'labels'
+stopifnot(all(flat$celltype %chin% labels))
+```
+
+# 8. add logCPM features
+```{r}
+message("Loading Seurat object to compute logCPM (RNA/ATAC pseudobulk) ...")
+seo <- readRDS(seurat_rds)
+stopifnot(celltype_col %in% colnames(seo@meta.data))
+seo <- subset(seo, cells = rownames(seo@meta.data)[seo@meta.data[[celltype_col]] %in% labels])
+
+# Prepare celltype factor with desired order
+seo@meta.data[[celltype_col]] <- factor(seo@meta.data[[celltype_col]], levels = labels)
+
+# RNA: gene_logCPM
+if ("RNA" %in% names(seo@assays)) {
+  DefaultAssay(seo) <- "RNA"
+  rna_counts <- GetAssayData(seo, assay = "RNA", slot = "counts") # genes x cells
+  
+  gene_names <- rownames(rna_counts)
+  if (looks_like_ensembl(gene_names)) {
+    map <- map_ensembl_to_symbol(gene_names)
+    valid <- !is.na(map[gene_names]) & nzchar(map[gene_names])
+    if (any(valid)) {
+      sym <- map[gene_names]
+      idx <- split(which(valid), sym[valid])  # indices per SYMBOL
+      summed <- do.call(rbind, lapply(idx, function(ix) Matrix::colSums(rna_counts[ix, , drop = FALSE])))
+      rna_counts_sym <- as(Matrix::Matrix(summed, sparse = TRUE), "dgCMatrix")
+      rownames(rna_counts_sym) <- names(idx)
+    } else {
+      warning("ID mapping yielded no symbols; using original rownames.")
+      rna_counts_sym <- rna_counts
+    }
+  } else {
+    rna_counts_sym <- rna_counts
+  }
+  
+  gene_log <- pseudobulk_logCPM(
+    rna_counts_sym,
+    factor(seo@meta.data[[celltype_col]], levels = labels)
+  )
+  setnames(gene_log, c("feature","celltype","logCPM"), c("gene","celltype","gene_logCPM"))
+  gene_log <- gene_log[gene %in% unique(flat$gene) & celltype %in% labels]
+  flat <- merge_left(flat, gene_log, by = c("gene","celltype"))
+} else {
+  warning("RNA assay not found; skipping gene_logCPM.")
+}
+
+# ATAC: peak_logCPM
+if ("ATAC" %in% names(seo@assays)) {
+  DefaultAssay(seo) <- "ATAC"
+  atac_counts <- GetAssayData(seo, assay = "ATAC", slot = "counts") # peaks x cells
+  
+  # ensure "chr-start-end"
+  peak_names <- rownames(atac_counts)
+  if (any(grepl(":", peak_names))) {
+    peak_names2 <- gsub(":", "-", peak_names)
+    peak_names2 <- gsub("(chr\\w+)-(\\d+)-(\\d+)", "\\1-\\2-\\3", peak_names2)
+    rownames(atac_counts) <- peak_names2
+    peak_names <- peak_names2
+  }
+  # keep chr1-3 peaks
+  keep_peaks <- grepl(paste0("^(", paste(keep_chr, collapse="|"), ")\\-\\d+\\-\\d+$"), peak_names)
+  if (any(keep_peaks)) atac_counts <- atac_counts[keep_peaks, , drop = FALSE]
+  
+  peak_log <- pseudobulk_logCPM(
+    atac_counts,
+    factor(seo@meta.data[[celltype_col]], levels = labels)
+  )
+  setnames(peak_log, c("feature","celltype","logCPM"), c("peak","celltype","peak_logCPM"))
+  peak_log <- peak_log[peak %in% unique(flat$peak) & celltype %in% labels]
+  flat <- merge_left(flat, peak_log, by = c("peak","celltype"))
+} else {
+  warning("ATAC assay not found; skipping peak_logCPM.")
+}
+```
+
+# 9. Write Outputs
+```{r}
+message("Writing new data.tsv ...")
+fwrite(flat, data_tsv_path, sep = "\t")
+message("Wrote: ", data_tsv_path)
+
+# Update predictors list
+score_cols <- setdiff(names(flat), base_cols)
+new_pred_names <- c("gene_logCPM", "peak_logCPM")
+preds <- c("snp_gene_distance","peak_gene_distance","closest_tss", score_cols)
+writeLines(unique(c(preds, new_pred_names)), predictors_path)
+writeLines("peak", dropdups_path)
+message("Updated: ", predictors_path, " and ", dropdups_path)
+message("Done.")
+```
+

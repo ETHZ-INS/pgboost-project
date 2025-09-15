@@ -1,0 +1,127 @@
+---
+title: "14_regularizedRegression.Rmd"
+author: "tobiasmohl"
+date: "2025-09-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  source("/mnt/plger/esonder/R/tg_enh/main_project_cisreg_elements/analysis/predEnhancer_cleaned.R")
+  library(Seurat)
+  library(rlang)
+  library(SingleCellExperiment)
+  library(data.table)
+  library(EnsDb.Hsapiens.v86)
+  library(Signac)
+  library(glmnet)
+  library(GenomicRanges)
+  library(BiocParallel)
+  library(scuttle)
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
+})
+
+set.seed(187)
+
+SCRIPT_DIR   <- getwd()
+PROJECT_ROOT <- file.path(SCRIPT_DIR, "..")
+DATA_DIR     <- file.path(PROJECT_ROOT, "data")
+OUTPUT_DIR   <- file.path(PROJECT_ROOT, "output")
+OUT_SCORE_DIR  <- file.path(OUTPUT_DIR, "feature_scores", "predEnhancer")
+dir.create(OUT_SCORE_DIR, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r}
+seurat_rds   <- file.path(DATA_DIR, "seo_RNA_ATAC_chr123.rds")
+cands_dir    <- file.path(OUTPUT_DIR, "candidates")
+celltypes_tsv <- file.path(DATA_DIR, "celltypes.tsv")
+celltype_col <- "cell_type_manual"
+
+family <- "poisson"
+decay <- "exp"
+
+out_dir_score <- file.path(OUT_SCORE_DIR , paste0(family, "-", decay), "score")
+out_dir_beta <- file.path(OUT_SCORE_DIR, paste0(family, "-", decay), "beta")
+
+
+dir.create(out_dir_score, recursive = TRUE, showWarnings = FALSE)
+dir.create(out_dir_beta, recursive = TRUE, showWarnings = FALSE)
+
+BPPARAM <- MulticoreParam(workers = 2)
+```
+
+```{r}
+keys_df <- read.delim(celltypes_tsv, stringsAsFactors = FALSE, strip.white = TRUE)
+stopifnot("celltype_key" %in% names(keys_df))
+keys <- unique(trimws(keys_df$celltype_key))
+keys <- keys[!is.na(keys) & nzchar(keys)]
+if (!length(keys)) stop("No valid cell types found in ", celltypes_tsv)
+message("Will run for cell types: ", paste(keys, collapse = ", "))
+
+seo <- readRDS(seurat_rds)
+
+# Gene mapping setup
+ensDb <- EnsDb.Hsapiens.v86
+geneInfo <- as.data.table(genes(ensDb))
+```
+
+```{r}
+# Loop over each cell type
+for (key in keys){
+  message("processing: ", key)
+  stopifnot(celltype_col %in% colnames(seo@meta.data))
+  seo_ct <- subset(x = seo, subset = !!rlang::sym(celltype_col) == key)
+  if (ncol(x = seo_ct) == 0) {
+    message("No cells found for cell type: ", key)
+    next
+  }
+  
+  sce_RNA <- as.SingleCellExperiment(seo_ct, assay = "RNA")
+  sce_ATAC <- as.SingleCellExperiment(seo_ct, assay = "ATAC")
+  
+  rowRanges(sce_ATAC) <- StringToGRanges(names(rowRanges(sce_ATAC)))
+  sce <- sce_RNA
+  altExp(sce, "ATAC") <- sce_ATAC
+  
+  common_genes <- intersect(rownames(sce), geneInfo$gene_name)
+  sce <- sce[common_genes, ]
+  filtered_geneInfo <- geneInfo[match(rownames(sce), geneInfo$gene_name), ]
+  
+  rownames(sce) <- filtered_geneInfo$gene_name
+  
+  ptm <- proc.time()
+  fit <- predEnhancer(
+    sce, 
+    distType = "dist",
+    family = family, 
+    decay = decay,   
+    ensDb = EnsDb.Hsapiens.v86,
+    genes = rownames(sce),
+    BPPARAM = BPPARAM
+  )
+  proc.time()
+  
+  fit$peak <- paste0("chr", fit$seqnames, "-", fit$start, "-", fit$end)
+  
+  regularized_regression_score = data.table(
+    peak = fit$peak,
+    gene = fit$target_gene,
+    score = fit$score)
+  
+  regularized_regression_beta = data.table(
+    peak = fit$peak,
+    gene = fit$target_gene,
+    beta = fit$beta)
+  
+  score_file <- file.path(out_dir_score, paste0("regularized_regression_", family, "-", decay, "-score_", key, ".tsv"))
+  beta_file <- file.path(out_dir_beta, paste0("regularized_regression_", family, "-", decay, "-score_", key, ".tsv"))
+  
+  fwrite(regularized_regression_score, score_file, sep = "\t")
+  fwrite(regularized_regression_beta,  beta_file,  sep = "\t")
+}
+
+```
+

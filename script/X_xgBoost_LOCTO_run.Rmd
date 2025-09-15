@@ -1,0 +1,189 @@
+---
+title: "X_xgBoost_ LOCTO_run.Rmd"
+author: "tobiasmohl"
+date: "2025-09-12"
+output: html_document
+---
+
+# 1. Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(xgboost)
+  library(dplyr)
+})
+
+set.seed(187)
+
+SCRIPT_DIR   <- getwd()
+PROJECT_ROOT <- normalizePath(file.path(SCRIPT_DIR, ".."), mustWork = FALSE)
+
+OUTPUT_DIR <- file.path(PROJECT_ROOT, "output")
+XGB_DIR    <- file.path(OUTPUT_DIR, "xgBoost_outputs")
+MODEL_DIR  <- file.path(XGB_DIR, "models")
+PRED_DIR   <- file.path(XGB_DIR, "predictions")
+
+run_name <- "xgBoost_loco_n1000_pgBoostFeatures_test"
+
+data_file      <- file.path(XGB_DIR, "data.tsv")
+training_file  <- file.path(PROJECT_ROOT, "data", "eqtl_files", "training_data_snppg_ALL_chr123.tsv.gz")
+predictor_file <- file.path(XGB_DIR, "predictors.txt")
+
+model_dir <- file.path(MODEL_DIR, run_name)
+pred_dir  <- file.path(PRED_DIR,  run_name)
+dir.create(model_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(pred_dir,  recursive = TRUE, showWarnings = FALSE)
+
+feat_out <- file.path(model_dir, "feature_names.txt")
+outfile  <- file.path(pred_dir, paste0(run_name, ".tsv"))
+```
+
+# 2. Preparation
+```{r}
+full_data <- fread(data_file)
+training_data <- fread(training_file)
+
+diag_overlap_cols <- function(full_data, training_data,
+                              cols = c("peak","gene","celltype","snp","chr")) {
+  res <- rbindlist(lapply(cols, function(col) {
+    fd_v <- full_data[[col]]
+    td_v <- training_data[[col]]
+
+    # NA counts (before coercion)
+    na_full  <- sum(is.na(fd_v))
+    na_train <- sum(is.na(td_v))
+
+    # Deduplicate uniques (exclude NA for overlap calc)
+    fd_dt <- unique(data.table(v = trimws(as.character(fd_v[!is.na(fd_v)]))))
+    td_dt <- unique(data.table(v = trimws(as.character(td_v[!is.na(td_v)]))))
+    setkey(fd_dt, v); setkey(td_dt, v)
+
+    ov <- nrow(fintersect(fd_dt, td_dt))
+
+    data.table(
+      column        = col,
+      full_unique   = nrow(fd_dt),
+      train_unique  = nrow(td_dt),
+      overlap       = ov,
+      pct_of_full   = round(100 * ov / max(1, nrow(fd_dt)), 2),
+      pct_of_train  = round(100 * ov / max(1, nrow(td_dt)), 2),
+      na_full       = na_full,
+      na_train      = na_train
+    )
+  }))
+  print(res)
+  invisible(res)
+}
+
+# Usage:
+index_cols <- c("peak","gene","celltype","snp","chr")
+diag_overlap_cols(full_data, training_data, cols = index_cols)
+
+```
+
+# 3.
+```{r}
+ct_map <- c(
+  Ast = "astrocytes",
+  MG  = "Microglia",
+  OD  = "Oligodendrocytes",
+  OPC = "OPC",
+  IN  = "Neurons",   # fuse IN → Neurons
+  Ext = "Neurons",    # fuse Ext → Neurons
+  End = "Endothelial"  
+)
+
+# apply mapping if key is present
+training_data[, celltype := ifelse(celltype %in% names(ct_map), 
+                                   ct_map[celltype], celltype)]
+
+# Merge on full identity
+index_cols <- c("peak", "gene", "celltype", "snp", "chr")
+setkeyv(full_data, index_cols)
+setkeyv(training_data, index_cols)
+data <- full_data[training_data, nomatch = 0L]
+
+# Labels: 1 = pos, 2 = strong neg -> make 0/1
+data[label == 2L, label := 0L]
+data <- data[label %in% c(0L, 1L)]
+
+cat(sprintf("Number of training instances: %s\n", nrow(data)))
+cat(sprintf("Number of positives: %s\n", sum(data$label == 1L)))
+cat(sprintf("Number of negatives: %s\n\n", sum(data$label == 0L)))
+
+# Predictors
+predictors <- scan(predictor_file, what = character(), quiet = TRUE)
+predictors <- c("snp_gene_distance", "closest_tss", "cicero", "scent", "signac")
+pred_cols  <- intersect(predictors, names(data))
+stopifnot(length(pred_cols) > 0)
+cat(sprintf("Using %d features for model training and prediction.\n\n", length(pred_cols)))
+
+```
+
+# 4. Run
+```{r}
+annotation_feature_tabb <- data[, pred_cols, with = FALSE]
+labels <- data$label
+LOO_colname <- "chr"
+chromosomes <- sort(unique(data[[LOO_colname]]))
+
+# save feature names once 
+writeLines(colnames(annotation_feature_tabb), feat_out)
+
+predictions <- data.frame()
+
+for (chr in chromosomes) {
+  cat(sprintf("Chromosome %s:\n", chr))
+
+  # Off-chromosome
+  train_idx <- data[[LOO_colname]] != chr
+  X_train   <- as.matrix(annotation_feature_tabb[train_idx, , drop = FALSE])
+  y_train   <- labels[train_idx]
+
+  cat(sprintf("Number of training instances: %s\n", length(y_train)))
+  cat(sprintf("Number of positives: %s\n", sum(y_train)))
+  cat(sprintf("Number of negatives: %s\n", length(y_train) - sum(y_train)))
+
+  # Train
+  bst <- xgboost(
+    data             = X_train,
+    label            = y_train,
+    max_depth        = 6,
+    eta              = 0.05,
+    gamma            = 10,
+    min_child_weight = 6,
+    subsample        = 0.8,
+    colsample_bytree = 1.0,
+    nrounds          = 1000,
+    nthread          = 2,
+    objective        = "binary:logistic",
+    eval_metric      = "auc",
+    verbose          = 1
+  )
+
+  # Save this fold’s model
+  model_path <- file.path(model_dir, sprintf("xgboost_loco_%s.model", chr))
+  xgb.save(bst, model_path)
+
+  # Predict on held-out chromosome
+  pred_idx <- data[[LOO_colname]] == chr
+  X_pred   <- as.matrix(annotation_feature_tabb[pred_idx, , drop = FALSE])
+  p_hat    <- predict(bst, X_pred)
+
+  chrom_predictions <- cbind(
+    as.data.frame(data[pred_idx, ..index_cols]),
+    xgBoost_probability = p_hat
+  )
+  predictions <- rbind(predictions, chrom_predictions)
+  cat(sprintf("Number of scored links: %s\n\n", nrow(chrom_predictions)))
+}
+
+predictions <- predictions %>%
+  mutate(xgBoost_percentile = percent_rank(xgBoost_probability))
+
+write.table(predictions, outfile, sep = "\t", row.names = FALSE, quote = FALSE)
+cat(sprintf("Total number of scored links: %s\n", nrow(predictions)))
+cat(sprintf("Saved predictions to %s.\n", outfile))
+```

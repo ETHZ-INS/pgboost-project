@@ -1,0 +1,105 @@
+---
+title: "13_meanATAC_varianceATAC.Rmd"
+author: "tobiasmohl"
+date: "2025-09-09"
+output: html_document
+---
+
+# 1. Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Matrix)
+  library(data.table)
+  library(dplyr)
+})
+
+set.seed(187)
+
+SCRIPT_DIR   <- getwd()
+PROJECT_ROOT <- file.path(SCRIPT_DIR, "..")
+DATA_DIR     <- file.path(PROJECT_ROOT, "data")
+OUTPUT_DIR   <- file.path(PROJECT_ROOT, "output")
+CAND_DIR     <- file.path(OUTPUT_DIR, "candidates")
+OUT_meanATAC_DIR  <- file.path(OUTPUT_DIR, "feature_scores", "meanATAC")
+OUT_varianceATAC_DIR  <- file.path(OUTPUT_DIR, "feature_scores", "varianceATAC")
+dir.create(OUT_meanATAC_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(OUT_varianceATAC_DIR, recursive = TRUE, showWarnings = FALSE)
+```
+
+# 2. Inputs/Parameters
+```{r}
+seurat_rds   <- file.path(DATA_DIR, "seo_RNA_ATAC_chr123.rds")
+cands_dir    <- file.path(OUTPUT_DIR, "candidates")
+assay_name   <- "ATAC"
+celltypes_tsv <- file.path(DATA_DIR, "celltypes.tsv")
+celltype_col <- "cell_type_manual"
+```
+
+# 3. Generate Scores
+```{r}
+seo <- readRDS(seurat_rds)
+stopifnot(celltype_col %in% colnames(seo@meta.data))
+
+keys_df <- read.delim(celltypes_tsv, stringsAsFactors = FALSE, strip.white = TRUE)
+col_key <- if ("celltype_key" %in% names(keys_df)) "celltype_key" else names(keys_df)[1]
+keys <- unique(trimws(keys_df[[col_key]]))
+keys <- keys[!is.na(keys) & nzchar(keys)]
+
+## ---------- main loop ----------
+for (key in keys) {
+  ct <- key
+  message("\n=== Processing cell type: ", ct, " ===")
+  
+  # subset cells of this cell type
+  cells_ct <- rownames(seo@meta.data)[seo@meta.data[[celltype_col]] == ct]
+  if (length(cells_ct) < 2L) {
+    warning("Skipping ", ct, " (only ", length(cells_ct), " cell(s))")
+    next
+  }
+  seo_ct <- subset(seo, cells = cells_ct)
+  
+  # peak x cell counts (sparse)
+  C <- GetAssayData(seo_ct, assay = assay_name, slot = "counts")
+  
+  # binarize: open if >=1 fragment 
+  B <- (C > 0) + 0
+  
+  # proportion-accessible per peak (p in [0,1]); Bernoulli variance p*(1-p)
+  p <- Matrix::rowMeans(B)
+  peak_stats <- data.frame(
+    peak_id   = rownames(B),
+    mean_atac = as.numeric(p),
+    var_atac  = as.numeric(p * (1 - p)),
+    stringsAsFactors = FALSE
+  )
+  
+  # read candidates and attach peak-level stats to each peak–gene pair
+  cand_file <- file.path(CAND_DIR, paste0("candidates_", key, ".tsv"))
+  cand <- fread(cand_file)
+  if (!"peak_id" %in% names(cand)) {
+    stop("File lacks 'peak_id' column: ", f)
+  }
+  
+  mean_tbl <- merge(cand, peak_stats[, c("peak_id","mean_atac")], by = "peak_id", all.x = TRUE)
+  data.table::setnames(mean_tbl, "peak_id", "peak")  
+  
+  var_tbl  <- merge(cand, peak_stats[, c("peak_id","var_atac")],  by = "peak_id", all.x = TRUE)
+  data.table::setnames(var_tbl,  "peak_id", "peak")
+
+  # write per-celltype outputs
+  outfile_mean <- file.path(OUT_meanATAC_DIR, paste0("links_with_meanATAC_", ct, ".tsv"))
+  outfile_var  <- file.path(OUT_varianceATAC_DIR,  paste0("links_with_ATACvariance_", ct, ".tsv"))
+  fwrite(mean_tbl, outfile_mean, sep = "\t")
+  fwrite(var_tbl,  outfile_var,  sep = "\t")
+  
+  # quick logs
+  message("Wrote: ", outfile_mean, " (n=", nrow(mean_tbl), ")")
+  message("Wrote: ", outfile_var,  " (n=", nrow(var_tbl),  ")")
+}
+
+message("\nAll done.")
+```
+

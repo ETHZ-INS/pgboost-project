@@ -1,0 +1,141 @@
+---
+title: "12_tad_run.Rmd"
+author: "tobiasmohl"
+date: "2025-09-09"
+output: html_document
+---
+
+# 1. Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(GenomicRanges)
+  library(BiocParallel)
+})
+
+set.seed(187)
+
+SCRIPT_DIR    <- getwd()
+PROJECT_ROOT  <- file.path(SCRIPT_DIR, "..")
+DATA_DIR      <- file.path(PROJECT_ROOT, "data")
+OUTPUT_DIR    <- file.path(PROJECT_ROOT, "output")
+CAND_DIR      <- file.path(OUTPUT_DIR, "candidates")
+OUT_SCORE_DIR <- file.path(OUTPUT_DIR, "feature_scores", "tad_scores")
+dir.create(OUT_SCORE_DIR, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r}
+CTCF_chip <- "/mnt/germain/datasets/ENCODE/chip"
+
+celltypes_tsv <- file.path(DATA_DIR, "celltypes.tsv")
+ctcf_rds <- file.path(DATA_DIR, "CTCF_aggregated.GR.rds")
+
+out_dir_n <- file.path(OUT_SCORE_DIR, "n_tad_boundaries_crossed")
+out_dir_sum <- file.path(OUT_SCORE_DIR, "sum_tad_scores")
+out_dir_pyth <- file.path(OUT_SCORE_DIR, "pythagorean_tad_scores")
+
+dir.create(out_dir_n, TRUE, TRUE)
+dir.create(out_dir_sum, TRUE, TRUE)
+dir.create(out_dir_pyth, TRUE, TRUE)
+```
+
+# 3. Prepare CTCF sites
+```{r}
+if (file.exists(ctcf_rds)){
+  ctcf <- readRDS(ctcf_rds)
+  ctcf_pt <- resize(ctcf, width = 1, fix = "center")
+} else {
+  lf <- list.files(CTCF_chip, pattern="_CTCF_", recursive = TRUE, full=TRUE)
+  writeLines(lf, "CTCF_aggregated_srcFiles.txt")
+  
+  p <- lapply(lf, \(x){
+    x <- rtracklayer::import(x, format="NarrowPeak")
+    g <- granges(x)
+    g$score <- x$signalValue
+    g
+  })
+  
+  p <- unlist(GRangesList(p))
+  pr <- reduce(p, with.revmap=TRUE)
+  
+  p2 <- bplapply(pr$revmap, BPPARAM=MulticoreParam(20, progress=TRUE), FUN=function(x){
+    g <- p[x]
+    GRanges(as.character(seqnames(g)[1]), IRanges(round(median(start(g))), round(median(end(g)))),
+            meanScore=mean(g$score), maxScore=max(g$score), sumScore=sum(g$score), pythScore=sqrt(sum(g$score^2)))
+  })
+  p2 <- unlist(GRangesList(p2))
+  p2 <- sort(p2)
+  p2 <- p2[which(p2$maxScore>=5)]
+  saveRDS(p2, file="CTCF_aggregated.GR.rds")
+  
+}
+```
+
+```{r}
+keys_df <- read.delim(celltypes_tsv, stringsAsFactors = FALSE, strip.white = TRUE)
+col_key <- if ("celltype_key" %in% names(keys_df)) "celltype_key" else names(keys_df)[1]
+keys <- unique(trimws(keys_df[[col_key]]))
+keys <- keys[!is.na(keys) & nzchar(keys)]
+
+
+for (ct in keys) {
+  cand_tsv <- file.path(candidates_dir, paste0("candidates_", ct, ".tsv"))
+  message(cand_tsv)
+  if (!file.exists(cand_tsv)) {
+    message("Missing candidates for ", ct, ": ", cand_tsv)
+    next
+  }
+  
+  L <- fread(cand_tsv)
+  if (!nrow(L)) {
+    message("Empty candidates for ", ct)
+    next
+  }
+  
+  L <- L[peak_chr == gene_chr]
+  if (!nrow(L)) {
+    message("No matching peaks")
+  }
+  
+  left <- pmin(L$peak_start, L$peak_end, L$tss)
+  right <- pmax(L$peak_start, L$peak_end, L$tss)
+  has <- (right - left) > 1L
+  seg_gr <- GRanges(L$peak_chr[has], IRanges(left[has] + 1L, right[has] - 1L))
+  
+  counts <- integer(nrow(L))
+  if (length(seg_gr)) counts[has] <- countOverlaps(seg_gr, ctcf_pt)
+  res_n <- data.table(peak = L$peak_id, gene_id = L$gene_id, score = counts)
+  
+  ov <- if (length(seg_gr)) findOverlaps(seg_gr, ctcf_pt) else Hits()
+  
+  # sumScore
+  DT_sum <- if (length(ov)) data.table(idx = queryHits(ov),
+                                       v = mcols(ctcf_pt)$sumScore[subjectHits(ov)])
+  else data.table(idx=integer(), v=numeric())
+  agg_sum <- DT_sum[, .(score = sum(v, na.rm = TRUE)), by = idx]
+  res_sum <- data.table(peak = L$peak_id, gene_id = L$gene_id, score = 0)
+  if (nrow(agg_sum)) {
+    map <- which(has)[agg_sum$idx]
+    set(res_sum, i = map, j = "score", value = agg_sum$score)
+  }
+  
+  # pythScore
+  DT_pyth <- if (length(ov)) data.table(idx = queryHits(ov),
+                                        v = mcols(ctcf_pt)$pythScore[subjectHits(ov)])
+  else data.table(idx=integer(), v=numeric())
+  agg_pyth <- DT_pyth[, .(score = sum(v, na.rm = TRUE)), by = idx]
+  res_pyth <- data.table(peak = L$peak_id, gene_id = L$gene_id, score = 0)
+  if (nrow(agg_pyth)) {
+    map <- which(has)[agg_pyth$idx]
+    set(res_pyth, i = map, j = "score", value = agg_pyth$score)
+  }
+  
+  fwrite(res_n, file.path(out_dir_n, paste0("n_boundaries_crossed_", ct, ".tsv")), sep="\t")
+  fwrite(res_sum, file.path(out_dir_sum, paste0("sum_boundary_sumScore_", ct, ".tsv")), sep="\t")
+  fwrite(res_pyth, file.path(out_dir_pyth, paste0("pythagorean_TAD_score_", ct, ".tsv")), sep="\t")
+  
+  message("Done: ", ct, " (", nrow(L), " links)")
+}
+```
+

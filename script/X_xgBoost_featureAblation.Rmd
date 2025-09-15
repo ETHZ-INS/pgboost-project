@@ -1,0 +1,244 @@
+---
+title: "X_xgBoost_featureAblation.Rmd"
+author: "tobiasmohl"
+date: "2025-09-14"
+output: html_document
+---
+
+# 1. Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(xgboost)
+  library(PRROC)
+  library(ggplot2)
+})
+
+set.seed(187)
+
+SCRIPT_DIR   <- getwd()
+PROJECT_ROOT <- normalizePath(file.path(SCRIPT_DIR, ".."), mustWork = FALSE)
+
+OUTPUT_DIR <- file.path(PROJECT_ROOT, "output")
+XGB_DIR    <- file.path(OUTPUT_DIR, "xgBoost_outputs")
+MODEL_DIR  <- file.path(XGB_DIR, "models")
+PRED_DIR   <- file.path(XGB_DIR, "predictions")
+
+run_name <- "xgBoost_LOCTO_featureAblation"
+
+data_file <- file.path(XGB_DIR, "data.tsv")
+training_file  <- file.path(PROJECT_ROOT, "data", "eqtl_files",
+                            "training_data_snppg_ALL_chr123.tsv.gz")
+
+model_dir <- file.path(MODEL_DIR, run_name)
+dir.create(model_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+# 2. Load Data
+```{r}
+full_data <- fread(data_file)
+training_data  <- fread(training_file)
+```
+
+# 3. Select Groups
+```{r}
+groups <- list(
+  distance      = c("snp_gene_distance","peak_gene_distance","closest_tss","distNearest_peakCentric"),
+  acc_mean      = c("ATACmean","peak_logCPM"),
+  acc_var       = c("ATACvariance"),
+  coaccess      = c("cicero","scent","signac"),
+  motif_arch    = c("rex"),
+  predEnhancer  = c("predEnhancer_g_exp_beta","predEnhancer_g_exp_score",
+                    "predEnhancer_g_lin_beta","predEnhancer_g_lin_score",
+                    "predEnhancer_p_exp_beta","predEnhancer_p_exp_score",
+                    "predEnhancer_p_lin_beta","predEnhancer_p_lin_score"),
+  topology_3d   = c("tad_n_boundaries","tad_pyt_score","tad_sum_score"),
+  conservation  = c("conservation"),
+  gene_expr     = c("gene_logCPM")
+)
+
+groups <- lapply(groups, function(v) intersect(v, names(full_data)))
+groups <- groups[lengths(groups) > 0]
+baseline_feats <- sort(unique(unlist(groups)))
+stopifnot(length(baseline_feats) > 0)
+
+cat("Baseline feature count:", length(baseline_feats), "\n")
+```
+
+# 4. Merge
+```{r}
+index_cols <- c("peak","gene","celltype","snp","chr")
+
+ct_map <- c(
+  Ast = "astrocytes",
+  MG  = "Microglia",
+  OD  = "Oligodendrocytes",
+  OPC = "OPC",
+  IN  = "Neurons",      # fuse IN → Neurons
+  Ext = "Neurons",      # fuse Ext → Neurons
+  End = "Endothelial"
+)
+
+training_data[, celltype := ifelse(celltype %in% names(ct_map),
+                                   ct_map[celltype], celltype)]
+stopifnot(all(index_cols %in% names(full_data)), all(index_cols %in% names(training_data)))
+setkeyv(full_data, index_cols)
+setkeyv(training_data, index_cols)
+data <- full_data[training_data, nomatch = 0L]
+
+# Labels 1=pos, 2=strong neg → 0/1
+data[label == 2L, label := 0L]
+data <- data[label %in% c(0L,1L)]
+```
+
+# 5.  Held-out cell types
+```{r}
+# Recompute held-outs AFTER mapping/join, so LOCTO sees the exact same CT names as baseline
+LOO_colname <- "celltype"
+heldouts <- sort(unique(as.character(data[[LOO_colname]])))
+cat("Held-out cell types:", paste(heldouts, collapse = ", "), "\n")
+
+# Make sure the features actually exist post-merge
+groups <- lapply(groups, function(v) intersect(v, names(data)))
+groups <- groups[lengths(groups) > 0]
+baseline_feats <- sort(unique(unlist(groups)))
+stopifnot(length(baseline_feats) > 0)
+```
+
+# 6. Metric Helpers
+```{r}
+logloss <- function(y, p, eps = 1e-15) {
+  p <- pmin(pmax(p, eps), 1 - eps)
+  -mean(y*log(p) + (1 - y)*log(1 - p))
+}
+
+score_fold <- function(y_true, p_hat) {
+  stopifnot(all(y_true %in% c(0,1)))
+  both_classes <- any(y_true==1) && any(y_true==0)
+  if (both_classes) {
+    pr <- PRROC::pr.curve(scores.class0 = p_hat[y_true==1],
+                          scores.class1 = p_hat[y_true==0], curve = FALSE)
+    ro <- PRROC::roc.curve(scores.class0 = p_hat[y_true==1],
+                           scores.class1 = p_hat[y_true==0], curve = FALSE)
+    auprc <- pr$auc.integral; auc <- ro$auc
+  } else {
+    auprc <- NA_real_; auc <- NA_real_
+  }
+  data.table(auprc = auprc,
+             auc   = auc,
+             logloss = logloss(y_true, p_hat))
+}
+
+```
+
+# 7. Run loCTo Function
+```{r}
+run_locto <- function(feat_set, tag = "baseline", save_models = TRUE) {
+  stopifnot(length(feat_set) > 0)
+  per_fold <- rbindlist(lapply(heldouts, function(h) {
+    tr_idx <- data[[LOO_colname]] != h
+    va_idx <- !tr_idx
+
+    X_tr <- as.matrix(data[tr_idx, ..feat_set])
+    y_tr <- data$label[tr_idx]
+    X_va <- as.matrix(data[va_idx, ..feat_set])
+    y_va <- data$label[va_idx]
+
+    bst <- xgboost::xgboost(
+      data             = X_tr,
+      label            = y_tr,
+      max_depth        = 6,
+      eta              = 0.05,
+      gamma            = 10,
+      min_child_weight = 6,
+      subsample        = 0.8,
+      colsample_bytree = 1.0,
+      nrounds          = 1000,
+      nthread          = 2,
+      objective        = "binary:logistic",
+      eval_metric      = "auc",
+      verbose          = 1
+    )
+
+    if (save_models) {
+      xgboost::xgb.save(bst, file.path(model_dir, sprintf("xgb_locto_%s_%s.model", tag, h)))
+    }
+
+    p_hat <- predict(bst, X_va)
+    mets  <- score_fold(y_va, p_hat)  
+    cbind(data.table(heldout = h, n_val = length(y_va), run_tag = tag), mets)
+  }))
+
+  summary <- per_fold[, .(
+    auprc   = mean(auprc,   na.rm = TRUE),
+    auc     = mean(auc,     na.rm = TRUE),
+    logloss = mean(logloss, na.rm = TRUE)
+  )]
+
+  list(per_fold = per_fold, summary = summary)
+}
+```
+
+# 8. Run Baseline
+```{r}
+cat("Training baseline with", length(baseline_feats), "features …\n")
+base_run <- run_locto(baseline_feats, tag = "base", save_models = TRUE)
+print(base_run$summary)
+fwrite(base_run$per_fold, file.path(model_dir, "baseline_per_fold.tsv"), sep = "\t")
+
+```
+
+# 9. Run Ablations
+```{r}
+ablation_rows <- lapply(names(groups), function(g) {
+  drop <- groups[[g]]
+  keep <- setdiff(baseline_feats, drop)
+  runG <- run_locto(keep, tag = paste0("drop_", g), save_models = TRUE)
+
+  # paired deltas by the same held-out cell type
+  d_per_fold <- merge(
+    runG$per_fold[, .(heldout, auprc_ab=auprc, auc_ab=auc, logloss_ab=logloss)],
+    base_run$per_fold[, .(heldout, auprc_base=auprc, auc_base=auc, logloss_base=logloss)],
+    by = "heldout"
+  )[, .(
+    d_auprc   = auprc_ab   - auprc_base,
+    d_auc     = auc_ab     - auc_base,
+    d_logloss = logloss_ab - logloss_base
+  )]
+
+  data.table(
+    group    = g,
+    n_drop   = length(drop),
+    n_keep   = length(keep),
+    auprc    = runG$summary$auprc,
+    auc      = runG$summary$auc,
+    logloss  = runG$summary$logloss,
+    d_auprc  = mean(d_per_fold$d_auprc,   na.rm = TRUE),
+    d_auc    = mean(d_per_fold$d_auc,     na.rm = TRUE),
+    d_logloss= mean(d_per_fold$d_logloss, na.rm = TRUE)
+  )
+})
+
+ablation_tbl <- rbindlist(ablation_rows)[order(d_auprc)]
+print(ablation_tbl)
+
+# Save table
+fwrite(ablation_tbl, file.path(model_dir, "ablation_summary.tsv"), sep = "\t")
+```
+
+# 10. Plot
+```{r}
+p <- ggplot(ablation_tbl, aes(x = reorder(group, d_auprc), y = d_auprc)) +
+  geom_col() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  coord_flip() +
+  labs(x = "Feature group removed", y = "ΔAUPRC vs baseline (paired)") +
+  theme_bw(base_size = 12)
+
+print(p)
+ggsave(file.path(model_dir, "ablation_delta_auprc.png"), p, width = 6, height = 4, dpi = 300)
+
+```
+

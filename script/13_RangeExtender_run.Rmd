@@ -102,7 +102,7 @@ build_LUT_from_positions <- function(peaks, pfm, genome, pad = 16L, p_cutoff = 0
   # geometry table always exists
   lut_geom <- data.table(
     peak_id = mcols(peaks)$peak_id,
-    chr     = as.character(seqnames(ext)),   # Ensembl names: "1","2","X","MT"
+    chr     = as.character(seqnames(ext)),  
     mid     = as.integer(mid)
   )
 
@@ -144,41 +144,36 @@ build_LUT_from_positions <- function(peaks, pfm, genome, pad = 16L, p_cutoff = 0
 
 LUT <- build_LUT_from_positions(peaks, rex_pfm, genome, pad = pad, p_cutoff = p_cut)
 
-## ---- AREX-style scoring per link using LUT ----
+## ---- REX-style scoring per link using LUT ----
 compute_arex_from_LUT <- function(cand, LUT) {
   cand <- as.data.table(cand)
 
-  # normalize column names and chr style
-  if ("peak" %in% names(cand) && !"peak_id" %in% names(cand)) {
-    setnames(cand, "peak", "peak_id")
-  }
-  if ("gene_chr" %in% names(cand)) {
-    cand[, gene_chr := sub("^chr", "", gene_chr)]
-  }
+  # Normalize column names 
+  if ("peak" %in% names(cand) && !"peak_id" %in% names(cand)) setnames(cand, "peak", "peak_id")
+  if (!"peak" %in% names(cand) && "peak_id" %in% names(cand)) cand[, peak := peak_id]
+  if ("gene_chr" %in% names(cand)) cand[, gene_chr := sub("^chr", "", gene_chr)]
 
-  # minimal columns required
-  req <- c("peak_id", "gene_chr", "tss")
+  # Require minimal inputs
+  req <- c("peak_id", "gene_id", "gene_chr", "tss")
   miss <- setdiff(req, names(cand))
   if (length(miss)) stop("Candidates missing columns: ", paste(miss, collapse = ", "))
 
-  DT <- merge(cand[, .(peak_id, gene_chr, tss)], LUT, by = "peak_id", all.x = TRUE)
+  # Merge full candidate table with per-peak LUT
+  DT <- merge(cand, LUT, by = "peak_id", all.x = TRUE)
 
-  # keep links on matching chromosome with valid geometry
+  # Keep valid geometry on same chromosome
   DT <- DT[gene_chr == chr & !is.na(tss) & !is.na(mid)]
 
+  # Toward vs. away relative to TSS
   toward_is_right <- DT$tss > DT$mid
   toward <- ifelse(toward_is_right, DT$score_right, DT$score_left)
   away   <- ifelse(toward_is_right, DT$score_left,  DT$score_right)
 
-  DT[, rex_toward := toward]
-  DT[, rex_away   := away]
-  DT[, score_raw  := toward - away]
   DT[, arex_score := (toward - away) / pmax(abs(toward), abs(away), 1e-6)]
 
-  # return one row per link with extras (keep more columns if you like)
-  DT[]
+  # Final 3-column output
+  DT[, .(peak = peak_id, gene = gene_id, score = arex_score)]
 }
-
 
 
 ```

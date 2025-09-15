@@ -1,0 +1,190 @@
+---
+title: "X_xgBoost_validation.Rmd"
+author: "tobiasmohl"
+date: "2025-09-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(TFBlearner)   
+  library(ggplot2)
+  library(PRROC)
+  library(scales)   
+})
+
+set.seed(187)
+
+SCRIPT_DIR   <- getwd()
+PROJECT_ROOT <- file.path(SCRIPT_DIR, "..")
+OUTPUT_DIR <- file.path(PROJECT_ROOT, "output")
+
+predictions <- fread(file.path(OUTPUT_DIR, "xgBoost_outputs/predictions/xgBoost_loco_n1000_LOCTO/xgBoost_loco_n1000_LOCTO.tsv"))
+
+```
+
+# Validate
+```{r}
+setDT(predictions); setkeyv(predictions, index_cols)
+setDT(data);        setkeyv(data,        index_cols)
+pred_eval <- data[predictions, nomatch = 0L]
+
+pred_eval <- pred_eval[!is.na(xgBoost_probability) & !is.na(label)]
+pred_eval[, method := "xgBoost"]
+
+aupr_tf <- function(DT, score_col = "xgBoost_probability", label_col = "label") {
+  if (length(unique(DT[[label_col]])) < 2L) return(NA_real_)
+  res <- TFBlearner:::.getPRCurve(
+    DT,
+    scores    = score_col,
+    labels    = label_col,
+    posClass  = 1,
+    negClass  = 0,
+    aggregate = TRUE,
+    models    = "method",
+    seed      = 187
+  )
+  res$auc_pr_mod
+}
+
+aupr_global <- aupr_tf(pred_eval)
+cat(sprintf("Global AUPR (TFBlearner): %.4f\n", aupr_global))
+
+by_ct_list <- lapply(split(pred_eval, pred_eval$celltype), aupr_tf)
+aupr_by_ct <- data.table(
+  celltype = names(by_ct_list),
+  auc_pr   = as.numeric(by_ct_list)
+)[order(celltype)]
+
+by_chr_list <- lapply(split(pred_eval, pred_eval$chr), aupr_tf)
+aupr_by_chr <- data.table(
+  chr    = names(by_chr_list),
+  auc_pr = as.numeric(by_chr_list)
+)[order(chr)]
+
+```
+
+```{r}
+setDT(pred_eval)
+pred_eval <- pred_eval[!is.na(xgBoost_probability) & !is.na(label)]
+
+# positives / negatives
+pos <- pred_eval[label == 1, xgBoost_probability]
+neg <- pred_eval[label == 0, xgBoost_probability]
+
+# PRROC-native curve (smooth) + AUPR
+pr <- PRROC::pr.curve(scores.class0 = pos, scores.class1 = neg, curve = TRUE)
+aupr     <- pr$auc.integral
+baseline <- mean(pred_eval$label == 1)
+
+# curve points
+pr_df <- data.frame(recall = pr$curve[,1], precision = pr$curve[,2])
+
+# (optional) thin to ≤1000 points for cleaner rendering without changing shape
+if (nrow(pr_df) > 1000) {
+  keep <- round(seq(1, nrow(pr_df), length.out = 1000))
+  pr_df <- pr_df[keep, , drop = FALSE]
+}
+
+# annotation label (no Lift)
+ann_txt <- sprintf("AUPR = %.3f\nBaseline = %.3f", aupr, baseline)
+
+ggplot(pr_df, aes(x = recall, y = precision)) +
+  # shade improvement over baseline
+  geom_ribbon(aes(ymin = baseline, ymax = pmax(precision, baseline)), alpha = 0.12) +
+  # original PRROC curve (do not switch to step)
+  geom_line(linewidth = 0.8) +
+  geom_hline(yintercept = baseline, linetype = "dashed") +
+  geom_label(aes(x = 0.02, y = 0.98, label = ann_txt),
+             hjust = 0, vjust = 1, label.size = 0, size = 3.4, inherit.aes = FALSE) +
+  scale_x_continuous(labels = percent_format(accuracy = 1),
+                     limits = c(0, 1), expand = c(0.001, 0)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1),
+                     limits = c(0, 1), expand = c(0.001, 0)) +
+  labs(title = "xgBoost Precision–Recall (LOCTO)",
+       x = "Recall", y = "Precision") +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(linewidth = 0.15),
+    plot.title       = element_text(face = "bold", size = 12),
+    axis.title       = element_text(face = "bold", size = 10),
+    axis.text        = element_text(size = 9)
+  )
+```
+
+
+
+```{r}
+setDT(pred_eval)
+
+# --- Build PR curves per cell type (PRROC-native; DO NOT alter precision) ---
+get_pr_df <- function(dt) {
+  if (length(unique(dt$label)) < 2L) return(NULL)
+  pos <- dt$xgBoost_probability[dt$label == 1]
+  neg <- dt$xgBoost_probability[dt$label == 0]
+  pr  <- PRROC::pr.curve(scores.class0 = pos, scores.class1 = neg, curve = TRUE)
+  data.table(
+    recall    = pr$curve[,1],
+    precision = pr$curve[,2],
+    AUPR      = pr$auc.integral,
+    celltype  = unique(dt$celltype)[1]
+  )
+}
+
+curves <- rbindlist(lapply(split(pred_eval, pred_eval$celltype), get_pr_df), fill = TRUE)
+stopifnot(nrow(curves) > 0)
+
+# Baseline (prevalence) per cell type & merge into curves so all layers can access
+baselines <- pred_eval[, .(baseline = mean(label == 1)), by = celltype]
+curves <- merge(curves, baselines, by = "celltype", all.x = TRUE)
+
+# One annotation row per facet
+ann_df <- unique(curves[, .(celltype, AUPR, baseline)])
+# --- annotations: no Lift, slightly lower placement ---
+ann_df <- unique(curves[, .(celltype, AUPR, baseline)])
+ann_df[, `:=`(
+  label_txt = sprintf("AUPR = %.3f\nBaseline = %.3f", AUPR, baseline),
+  x = 0.02,
+  y = 0.96
+)]
+
+# --- plot: smaller fonts/lines, lighter shading ---
+ggplot(curves, aes(x = recall, y = precision)) +
+  geom_ribbon(aes(ymin = baseline, ymax = pmax(precision, baseline)), alpha = 0.12) +
+  geom_line(linewidth = 0.7) +                                   # thinner curve
+  geom_hline(data = unique(curves[, .(celltype, baseline)]),
+             aes(yintercept = baseline), linetype = "dashed") +
+  geom_label(data = ann_df,
+             aes(x = x, y = y, label = label_txt),
+             hjust = 0, vjust = 1, label.size = 0, size = 3.2) + # smaller label
+  facet_wrap(~ celltype) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, 1), expand = c(0.001, 0)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, 1), expand = c(0.001, 0)) +
+  labs(title = "xgBoost Precision–Recall by Cell Type (LOCTO)",
+       x = "Recall", y = "Precision") +
+  theme_minimal(base_size = 11) +                                # smaller base font
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(linewidth = 0.15),
+    strip.text       = element_text(face = "bold", size = 11),
+    plot.title       = element_text(face = "bold", size = 12),
+    axis.title       = element_text(face = "bold", size = 10),
+    axis.text        = element_text(size = 9),
+    panel.spacing    = grid::unit(0.8, "lines")
+  )
+
+```
+
+```{r}
+xgb.importance(colnames(X_train), label = y_train, model = bst)
+
+xgb.importance(colnames(X_train), model = bst, data = X_train, label = y_train)
+
+```
+
