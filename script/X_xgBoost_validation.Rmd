@@ -13,178 +13,377 @@ suppressPackageStartupMessages({
   library(TFBlearner)   
   library(ggplot2)
   library(PRROC)
-  library(scales)   
+  library(scales)
+  library(xgboost)
 })
 
 set.seed(187)
+run_name <- "xgBoost_aggregated"
 
 SCRIPT_DIR   <- getwd()
 PROJECT_ROOT <- file.path(SCRIPT_DIR, "..")
-OUTPUT_DIR <- file.path(PROJECT_ROOT, "output")
+OUTPUT_DIR   <- file.path(PROJECT_ROOT, "output")
+XGB_DIR      <- file.path(OUTPUT_DIR, "xgBoost_outputs")
 
-predictions <- fread(file.path(OUTPUT_DIR, "xgBoost_outputs/predictions/xgBoost_loco_n1000_LOCTO/xgBoost_loco_n1000_LOCTO.tsv"))
+# --- load reference data with labels ---
+data_file <- file.path(XGB_DIR, "data_aggregated.tsv")
+pred_file <- file.path(XGB_DIR, "predictions", run_name, paste0(run_name, ".tsv"))
+training_file  <- file.path(PROJECT_ROOT, "data", "eqtl_files", "training_data_snppg_aggregated.tsv.gz")
+evaluationlog <- file.path(XGB_DIR, "predictions", run_name, "evaluationlog.rds")
+feature_names <- file.path(XGB_DIR, "models", run_name, "feature_names.txt")
+model_dir <-file.path(XGB_DIR, "models", run_name)
 
+index_cols <- c("peak","gene","celltype")
+
+predictions <- fread(pred_file)
+full_data <- fread(data_file)
+training_data <- fread(training_file)
+evaluationlog <- readRDS(evaluationlog)
+features <- scan(file.path(model_dir, "feature_names.txt"), what = character())
 ```
 
-# Validate
 ```{r}
+
+ct_map <- c(
+  Ast = "astrocytes",
+  MG  = "Microglia",
+  OD  = "Oligodendrocytes",
+  OPC = "OPC",
+  IN  = "Neurons",
+  Ext = "Neurons",
+  End = "Endothelial"
+)
+
+remap_ct <- function(x) ifelse(x %in% names(ct_map), ct_map[x], x)
+training_data[, celltype := remap_ct(celltype)]
+full_data[,     celltype := remap_ct(celltype)]
+
+# merge full features with labels
+setkeyv(full_data, index_cols)
+setkeyv(training_data, index_cols)
+data <- full_data[training_data, nomatch = 0L]
+
+# normalize labels
+data[label == 2L, label := 0L]
+data <- data[label %in% c(0L, 1L)]
+```
+
+```{r fig.width=8, fig.height=6}
+evaluationlog <- as.data.table(evaluationlog)
+
+plot_df <- melt(
+  evaluationlog,
+  id.vars = c("iter", "celltype"),
+  measure.vars = list(
+    AUPR = c("train_aucpr_mean", "test_aucpr_mean"),
+    SD   = c("train_aucpr_std",  "test_aucpr_std")
+  ),
+  variable.name = "dataset"
+)
+
+# Label dataset as Train/Test
+plot_df[, dataset := fifelse(dataset == 1, "Train", "Test")]
+
+avg_df <- plot_df[, .(
+  AUPR = mean(AUPR),
+  SD   = mean(SD)   # or sqrt(mean(SD^2)) for pooled
+), by = .(iter, dataset)]
+
+ggplot(avg_df, aes(x = iter, y = AUPR, color = dataset, fill = dataset)) +
+  geom_line(size = 1) +
+  geom_ribbon(aes(ymin = AUPR - SD, ymax = AUPR + SD),
+              alpha = 0.15, color = NA) +
+  labs(x = "Iteration", y = "AUPR (averaged across CTs)", title = run_name) +
+  theme_minimal(base_size = 13)+
+  xlim(0, 65)
+
+
+ggplot(evaluationlog, aes(x = iter, y = test_aucpr_mean, color = celltype)) +
+  geom_line(size = 0.9) +
+  labs(x = "Boosting round", y = "Test AUPR",
+       title = run_name) +
+  theme_minimal(base_size = 12)
+```
+
+
+
+
+```{r fig.width=10, fig.height=4}
+aupr_prroc <- function(DT, score_col = "xgBoost_probability", label_col = "label") {
+  pos_scores <- DT[[score_col]][DT[[label_col]] == 1]
+  neg_scores <- DT[[score_col]][DT[[label_col]] == 0]
+  if (length(pos_scores) == 0 || length(neg_scores) == 0) return(NULL)
+  
+  pr <- pr.curve(scores.class0 = pos_scores,
+                 scores.class1 = neg_scores,
+                 curve = TRUE)
+  pr
+}
+
 setDT(predictions); setkeyv(predictions, index_cols)
 setDT(data);        setkeyv(data,        index_cols)
-pred_eval <- data[predictions, nomatch = 0L]
 
+pred_eval <- data[predictions, nomatch = 0L]
 pred_eval <- pred_eval[!is.na(xgBoost_probability) & !is.na(label)]
 pred_eval[, method := "xgBoost"]
 
-aupr_tf <- function(DT, score_col = "xgBoost_probability", label_col = "label") {
-  if (length(unique(DT[[label_col]])) < 2L) return(NA_real_)
-  res <- TFBlearner:::.getPRCurve(
-    DT,
-    scores    = score_col,
-    labels    = label_col,
-    posClass  = 1,
-    negClass  = 0,
-    aggregate = TRUE,
-    models    = "method",
-    seed      = 187
-  )
-  res$auc_pr_mod
-}
+# --- Global curve ---
+pr_global <- aupr_prroc(pred_eval)
 
-aupr_global <- aupr_tf(pred_eval)
-cat(sprintf("Global AUPR (TFBlearner): %.4f\n", aupr_global))
+cat(sprintf("Global AUPR (PRROC): %.4f\n", pr_global$auc.integral))
 
-by_ct_list <- lapply(split(pred_eval, pred_eval$celltype), aupr_tf)
+df_curve <- as.data.table(pr_global$curve)
+setnames(df_curve, c("Precision", "Recall", "Threshold"))
+
+# compute global baseline
+baseline_global <- mean(pred_eval$label == 1)
+
+ggplot(df_curve, aes(x = Recall, y = Precision)) +
+  geom_line(size = 0.9, color = "steelblue", lineend = "round", linejoin = "round") +
+  geom_hline(yintercept = baseline_global, linetype = "dashed", color = "grey40") +
+  labs(
+    x = "Recall",
+    y = "Precision",
+    title = sprintf(
+      "%s — Global PR Curve (AUPR = %.3f | Baseline = %.3f)",
+      run_name, pr_global$auc.integral, baseline_global
+    )
+  ) +
+  theme_minimal(base_size = 12)
+
+# --- Celltype curves ---
+prs_ct <- lapply(split(pred_eval, pred_eval$celltype), aupr_prroc)
+
+df_all_ct <- rbindlist(lapply(names(prs_ct), function(ct) {
+  pr <- prs_ct[[ct]]
+  if (is.null(pr)) return(NULL)
+  df <- as.data.table(pr$curve)
+  setnames(df, c("Precision", "Recall", "Threshold"))
+  df[, celltype := ct]
+  df
+}), fill = TRUE)
+
+# baseline precision per celltype
+baseline_ct <- pred_eval[, .(
+  baseline = mean(label == 1)
+), by = celltype]
+
+# AUPR per celltype
 aupr_by_ct <- data.table(
-  celltype = names(by_ct_list),
-  auc_pr   = as.numeric(by_ct_list)
-)[order(celltype)]
+  celltype = names(prs_ct),
+  auc_pr   = sapply(prs_ct, function(x) if (is.null(x)) NA_real_ else x$auc.integral)
+)
 
-by_chr_list <- lapply(split(pred_eval, pred_eval$chr), aupr_tf)
-aupr_by_chr <- data.table(
-  chr    = names(by_chr_list),
-  auc_pr = as.numeric(by_chr_list)
-)[order(chr)]
+# Merge
+ct_stats <- merge(baseline_ct, aupr_by_ct, by = "celltype")
 
-```
-
-```{r}
-setDT(pred_eval)
-pred_eval <- pred_eval[!is.na(xgBoost_probability) & !is.na(label)]
-
-# positives / negatives
-pos <- pred_eval[label == 1, xgBoost_probability]
-neg <- pred_eval[label == 0, xgBoost_probability]
-
-# PRROC-native curve (smooth) + AUPR
-pr <- PRROC::pr.curve(scores.class0 = pos, scores.class1 = neg, curve = TRUE)
-aupr     <- pr$auc.integral
-baseline <- mean(pred_eval$label == 1)
-
-# curve points
-pr_df <- data.frame(recall = pr$curve[,1], precision = pr$curve[,2])
-
-# (optional) thin to ≤1000 points for cleaner rendering without changing shape
-if (nrow(pr_df) > 1000) {
-  keep <- round(seq(1, nrow(pr_df), length.out = 1000))
-  pr_df <- pr_df[keep, , drop = FALSE]
-}
-
-# annotation label (no Lift)
-ann_txt <- sprintf("AUPR = %.3f\nBaseline = %.3f", aupr, baseline)
-
-ggplot(pr_df, aes(x = recall, y = precision)) +
-  # shade improvement over baseline
-  geom_ribbon(aes(ymin = baseline, ymax = pmax(precision, baseline)), alpha = 0.12) +
-  # original PRROC curve (do not switch to step)
-  geom_line(linewidth = 0.8) +
-  geom_hline(yintercept = baseline, linetype = "dashed") +
-  geom_label(aes(x = 0.02, y = 0.98, label = ann_txt),
-             hjust = 0, vjust = 1, label.size = 0, size = 3.4, inherit.aes = FALSE) +
-  scale_x_continuous(labels = percent_format(accuracy = 1),
-                     limits = c(0, 1), expand = c(0.001, 0)) +
-  scale_y_continuous(labels = percent_format(accuracy = 1),
-                     limits = c(0, 1), expand = c(0.001, 0)) +
-  labs(title = "xgBoost Precision–Recall (LOCTO)",
-       x = "Recall", y = "Precision") +
-  theme_minimal(base_size = 11) +
-  theme(
-    panel.grid.minor = element_blank(),
-    panel.grid.major = element_line(linewidth = 0.15),
-    plot.title       = element_text(face = "bold", size = 12),
-    axis.title       = element_text(face = "bold", size = 10),
-    axis.text        = element_text(size = 9)
-  )
-```
-
-
-
-```{r}
-setDT(pred_eval)
-
-# --- Build PR curves per cell type (PRROC-native; DO NOT alter precision) ---
-get_pr_df <- function(dt) {
-  if (length(unique(dt$label)) < 2L) return(NULL)
-  pos <- dt$xgBoost_probability[dt$label == 1]
-  neg <- dt$xgBoost_probability[dt$label == 0]
-  pr  <- PRROC::pr.curve(scores.class0 = pos, scores.class1 = neg, curve = TRUE)
-  data.table(
-    recall    = pr$curve[,1],
-    precision = pr$curve[,2],
-    AUPR      = pr$auc.integral,
-    celltype  = unique(dt$celltype)[1]
-  )
-}
-
-curves <- rbindlist(lapply(split(pred_eval, pred_eval$celltype), get_pr_df), fill = TRUE)
-stopifnot(nrow(curves) > 0)
-
-# Baseline (prevalence) per cell type & merge into curves so all layers can access
-baselines <- pred_eval[, .(baseline = mean(label == 1)), by = celltype]
-curves <- merge(curves, baselines, by = "celltype", all.x = TRUE)
-
-# One annotation row per facet
-ann_df <- unique(curves[, .(celltype, AUPR, baseline)])
-# --- annotations: no Lift, slightly lower placement ---
-ann_df <- unique(curves[, .(celltype, AUPR, baseline)])
-ann_df[, `:=`(
-  label_txt = sprintf("AUPR = %.3f\nBaseline = %.3f", AUPR, baseline),
-  x = 0.02,
-  y = 0.96
+# Legend labels
+ct_stats[, label := sprintf(
+  "%s (AUPR = %.2f | Baseline = %.2f)",
+  celltype, auc_pr, baseline
 )]
 
-# --- plot: smaller fonts/lines, lighter shading ---
-ggplot(curves, aes(x = recall, y = precision)) +
-  geom_ribbon(aes(ymin = baseline, ymax = pmax(precision, baseline)), alpha = 0.12) +
-  geom_line(linewidth = 0.7) +                                   # thinner curve
-  geom_hline(data = unique(curves[, .(celltype, baseline)]),
-             aes(yintercept = baseline), linetype = "dashed") +
-  geom_label(data = ann_df,
-             aes(x = x, y = y, label = label_txt),
-             hjust = 0, vjust = 1, label.size = 0, size = 3.2) + # smaller label
-  facet_wrap(~ celltype) +
-  scale_x_continuous(labels = scales::percent_format(accuracy = 1),
-                     limits = c(0, 1), expand = c(0.001, 0)) +
-  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
-                     limits = c(0, 1), expand = c(0.001, 0)) +
-  labs(title = "xgBoost Precision–Recall by Cell Type (LOCTO)",
-       x = "Recall", y = "Precision") +
-  theme_minimal(base_size = 11) +                                # smaller base font
-  theme(
-    panel.grid.minor = element_blank(),
-    panel.grid.major = element_line(linewidth = 0.15),
-    strip.text       = element_text(face = "bold", size = 11),
-    plot.title       = element_text(face = "bold", size = 12),
-    axis.title       = element_text(face = "bold", size = 10),
-    axis.text        = element_text(size = 9),
-    panel.spacing    = grid::unit(0.8, "lines")
-  )
+# Plot
+ggplot(df_all_ct, aes(x = Recall, y = Precision, color = celltype)) +
+  geom_line(size = 0.9) +
+  geom_hline(data = ct_stats,
+             aes(yintercept = baseline, color = celltype),
+             linetype = "dashed") +
+  scale_color_manual(
+    values = setNames(scales::hue_pal()(nrow(ct_stats)), ct_stats$celltype),
+    labels = ct_stats$label
+  ) +
+  labs(
+    x = "Recall",
+    y = "Precision",
+    title = sprintf("%s — PR Curves by Celltype", run_name),
+    color = "Celltype"
+  ) +
+  theme_minimal(base_size = 12)
+
+ggplot(pred_eval, aes(x = xgBoost_probability, fill = factor(label))) +
+  geom_density(alpha = 0.4) +
+  facet_wrap(~celltype) +
+  theme_minimal()
+```
+
+```{r fig.width=12, fig.height=12}
+model_files <- list.files(
+  model_dir,
+  pattern = "\\.model$",
+  full.names = TRUE
+)
+
+importance_list <- lapply(model_files, function(mf) {
+  bst <- xgb.load(mf)
+  imp <- xgb.importance(model = bst, feature_names = features)
+  
+  data.table(imp)[, celltype := gsub("xgboost_|\\.model", "", basename(mf))]
+})
+
+importance_dt <- rbindlist(importance_list, fill = TRUE)
+
+# take top 10 features per celltype by Gain
+top_feats <- importance_dt[, head(.SD, 23), by = celltype]
+
+# compute ordering by decreasing mean Gain across celltypes
+feat_order <- top_feats[, .(mean_gain = mean(Gain, na.rm = TRUE)), by = Feature][
+  order(mean_gain, decreasing = FALSE)
+]$Feature
+
+# apply ordering
+top_feats[, Feature := factor(Feature, levels = feat_order)]
+
+# plot grouped bars
+ggplot(top_feats, aes(x = Gain, y = Feature, fill = celltype)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  labs(
+    x = "Importance (Gain)",
+    y = "Feature",
+    title = "Feature Importance"
+  ) +
+  theme_minimal(base_size = 12)
 
 ```
 
+
 ```{r}
-xgb.importance(colnames(X_train), label = y_train, model = bst)
+aupr_val <- function(DT, score_col = "xgBoost_probability", label_col = "label") {
+  pos_scores <- DT[[score_col]][DT[[label_col]] == 1]
+  neg_scores <- DT[[score_col]][DT[[label_col]] == 0]
+  if (length(pos_scores) == 0 || length(neg_scores) == 0) return(NA_real_)
+  
+  pr <- pr.curve(scores.class0 = pos_scores,
+                 scores.class1 = neg_scores,
+                 curve = TRUE)
+  pr$auc.integral
+}
 
-xgb.importance(colnames(X_train), model = bst, data = X_train, label = y_train)
+DT <- copy(pred_eval)
 
+# bin distances (here: 5kb bins up to 500kb)
+bin_size <- 5000
+DT[, dist_bin := pmin(500000, floor(peak_gene_distance / bin_size) * bin_size)]
+
+# compute mean score per bin
+dist_summary <- DT[, .(
+  mean_score = mean(xgBoost_probability, na.rm = TRUE)
+), by = dist_bin][order(dist_bin)]
+
+ggplot(dist_summary, aes(x = dist_bin, y = mean_score)) +
+  geom_line(color = "steelblue", size = 1) +
+  labs(
+    x = "Peak–Gene distance (bp)",
+    y = "Average xgBoost score",
+    title = "xgBoost score vs. Peak–Gene distance"
+  ) +
+  theme_minimal(base_size = 12)
+
+dist_summary <- DT[, .(mean_score = mean(xgBoost_probability)), 
+                   by = .(dist_bin, celltype)]
+ggplot(dist_summary, aes(x = dist_bin, y = mean_score, color = celltype)) +
+  geom_line(size = 1)
+
+# Bin distances into categorical ranges
+pred_eval[, dist_bin := cut(
+  peak_gene_distance,
+  breaks = c(0, 10000, 20000, 50000, 100000, 250000, 500000),
+  include.lowest = TRUE,
+  labels = c("0–10 kb","10-20 kb", "20–50 kb", "50–100 kb", "100–250 kb", "250–500 kb")
+)]
+
+# Compute AUPR per bin × celltype
+aupr_by_dist_ct <- pred_eval[, .(
+  aupr = aupr_val(.SD)   # numeric function from before
+), by = .(dist_bin, celltype)]
+
+# Plot
+ggplot(aupr_by_dist_ct, aes(x = dist_bin, y = aupr, color = celltype, group = celltype)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  labs(
+    x = "Peak–Gene distance bin (bp)",
+    y = "AUPR",
+    title = "AUPR vs. Peak–Gene distance by Celltype"
+  ) +
+  theme_minimal(base_size = 12)
+```
+```{r}
+library(data.table)
+
+all_features <- c(
+  "peak_gene_distance", "closest_tss", "ATACmean", "ATACvariance",
+  "cicero", "conservation", "distNearest_peakCentric",
+  "predEnhancer_g_exp_beta", "predEnhancer_g_exp_score",
+  "predEnhancer_g_lin_beta", "predEnhancer_g_lin_score",
+  "predEnhancer_p_exp_beta", "predEnhancer_p_exp_score",
+  "predEnhancer_p_lin_beta", "predEnhancer_p_lin_score",
+  "rex", "scent", "signac",
+  "tad_n_boundaries", "tad_pyt_score", "tad_sum_score",
+  "gene_logCPM", "peak_logCPM"
+)
+
+# extract only these features as a numeric matrix
+linking_feats <- pred_eval[, ..all_features]
+
+# compute correlation matrix
+cor_mat <- cor(linking_feats, use = "pairwise.complete.obs", method = "pearson")
+library(corrplot)
+corrplot(cor_mat, method = "color", type = "lower",
+         tl.col = "black", tl.srt = 45)
+
+library(pheatmap)
+pheatmap(cor_mat,
+         color = colorRampPalette(c("white", "red"))(100),
+         display_numbers = TRUE,
+         cluster_rows = FALSE,
+         cluster_cols = FALSE)
+
+
+all_features <- c(
+  "peak_gene_distance", "closest_tss",
+  "ATACmean", "ATACvariance", "peak_logCPM",
+  "cicero", "conservation", "distNearest_peakCentric",
+  "predEnhancer_g_exp_beta", "predEnhancer_g_exp_score",
+  "predEnhancer_g_lin_beta", "predEnhancer_g_lin_score",
+  "predEnhancer_p_exp_beta", "predEnhancer_p_exp_score",
+  "predEnhancer_p_lin_beta", "predEnhancer_p_lin_score",
+  "rex", "scent", "signac",
+  "tad_n_boundaries", "tad_pyt_score", "tad_sum_score",
+  "gene_logCPM"
+)
+
+# extract full feature matrix
+linking_feats <- pred_eval[, ..all_features]
+
+# z-score normalize each column (so means are comparable)
+linking_feats_z <- scale(linking_feats)
+
+# build new grouped feature matrix
+group_mat <- data.table(
+  peak_gene_distance      = linking_feats_z[, "peak_gene_distance"],
+  closest_tss             = linking_feats_z[, "closest_tss"],
+  ATAC                    = rowMeans(linking_feats_z[, c("ATACmean","ATACvariance","peak_logCPM")], na.rm = TRUE),
+  cicero                  = linking_feats_z[, "cicero"],
+  conservation            = linking_feats_z[, "conservation"],
+  distNearest_peakCentric = linking_feats_z[, "distNearest_peakCentric"],
+  PredEnhancer            = rowMeans(linking_feats_z[, grep("^predEnhancer", colnames(linking_feats_z))], na.rm = TRUE),
+  rex                     = linking_feats_z[, "rex"],
+  scent                   = linking_feats_z[, "scent"],
+  signac                  = linking_feats_z[, "signac"],
+  tad_scores              = rowMeans(linking_feats_z[, c("tad_n_boundaries","tad_pyt_score","tad_sum_score")], na.rm = TRUE),
+  gene_logCPM             = linking_feats_z[, "gene_logCPM"]
+)
+
+# compute correlation
+cor_group <- cor(group_mat, use = "pairwise.complete.obs")
+
+# plot
+pheatmap(cor_group,
+         color = colorRampPalette(c("red","white", "purple"))(100),
+         display_numbers = TRUE,
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         main = "Correlation of linking features")
 ```
 

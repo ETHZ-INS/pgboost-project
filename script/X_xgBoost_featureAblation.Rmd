@@ -26,11 +26,11 @@ XGB_DIR    <- file.path(OUTPUT_DIR, "xgBoost_outputs")
 MODEL_DIR  <- file.path(XGB_DIR, "models")
 PRED_DIR   <- file.path(XGB_DIR, "predictions")
 
-run_name <- "xgBoost_LOCTO_featureAblation"
+run_name <- "xgBoost_aggregated_featureAblation"
 
-data_file <- file.path(XGB_DIR, "data.tsv")
+data_file <- file.path(XGB_DIR, "data_aggregated.tsv")
 training_file  <- file.path(PROJECT_ROOT, "data", "eqtl_files",
-                            "training_data_snppg_ALL_chr123.tsv.gz")
+                            "training_data_snppg_aggregated.tsv.gz")
 
 model_dir <- file.path(MODEL_DIR, run_name)
 dir.create(model_dir, recursive = TRUE, showWarnings = FALSE)
@@ -45,7 +45,7 @@ training_data  <- fread(training_file)
 # 3. Select Groups
 ```{r}
 groups <- list(
-  distance      = c("snp_gene_distance","peak_gene_distance","closest_tss","distNearest_peakCentric"),
+  distance      = c("peak_gene_distance","closest_tss","distNearest_peakCentric"),
   acc_mean      = c("ATACmean","peak_logCPM"),
   acc_var       = c("ATACvariance"),
   coaccess      = c("cicero","scent","signac"),
@@ -69,7 +69,7 @@ cat("Baseline feature count:", length(baseline_feats), "\n")
 
 # 4. Merge
 ```{r}
-index_cols <- c("peak","gene","celltype","snp","chr")
+index_cols <- c("peak","gene","celltype")
 
 ct_map <- c(
   Ast = "astrocytes",
@@ -87,6 +87,8 @@ stopifnot(all(index_cols %in% names(full_data)), all(index_cols %in% names(train
 setkeyv(full_data, index_cols)
 setkeyv(training_data, index_cols)
 data <- full_data[training_data, nomatch = 0L]
+
+restrict_peaks <- unique(training_data$peak)
 
 # Labels 1=pos, 2=strong neg → 0/1
 data[label == 2L, label := 0L]
@@ -114,7 +116,7 @@ logloss <- function(y, p, eps = 1e-15) {
   -mean(y*log(p) + (1 - y)*log(1 - p))
 }
 
-score_fold <- function(y_true, p_hat) {
+score_fold <- function(y_true, p_hat, peaks, restrict_peaks) {
   stopifnot(all(y_true %in% c(0,1)))
   both_classes <- any(y_true==1) && any(y_true==0)
   if (both_classes) {
@@ -126,9 +128,48 @@ score_fold <- function(y_true, p_hat) {
   } else {
     auprc <- NA_real_; auc <- NA_real_
   }
-  data.table(auprc = auprc,
-             auc   = auc,
-             logloss = logloss(y_true, p_hat))
+
+  # Global average enrichment
+  avg_enrich_global <- calc_avg_enrichment(y_true, p_hat)
+
+  # Restricted-to-training-peaks average enrichment
+  keep <- peaks %in% restrict_peaks
+  if (any(keep) && any(y_true[keep] == 1)) {
+    avg_enrich_restrict <- calc_avg_enrichment(y_true[keep], p_hat[keep])
+  } else {
+    avg_enrich_restrict <- NA_real_
+  }
+
+  data.table(
+    auprc = auprc,
+    auc   = auc,
+    logloss = logloss(y_true, p_hat),
+    avg_enrichment_global   = avg_enrich_global,
+    avg_enrichment_restrict = avg_enrich_restrict
+  )
+}
+
+calc_avg_enrichment <- function(y_true, scores) {
+  stopifnot(length(y_true) == length(scores))
+  ord <- order(scores, decreasing = TRUE)
+  y_true <- y_true[ord]
+
+  n_true <- sum(y_true == 1)
+  if (n_true == 0) return(NA_real_)
+
+  # cumulative TP count
+  tp <- cumsum(y_true == 1)
+  pred <- seq_along(y_true)
+
+  # recall and enrichment at each prediction
+  recall <- tp / n_true
+  frac_pred <- pred / length(y_true)
+  enrichment <- (tp / n_true) / frac_pred
+
+  # average enrichment: mean of enrichment values at true positive steps
+  avg_enrichment <- mean(enrichment[y_true == 1])
+
+  return(avg_enrichment)
 }
 
 ```
@@ -137,39 +178,104 @@ score_fold <- function(y_true, p_hat) {
 ```{r}
 run_locto <- function(feat_set, tag = "baseline", save_models = TRUE) {
   stopifnot(length(feat_set) > 0)
-  per_fold <- rbindlist(lapply(heldouts, function(h) {
-    tr_idx <- data[[LOO_colname]] != h
-    va_idx <- !tr_idx
 
-    X_tr <- as.matrix(data[tr_idx, ..feat_set])
-    y_tr <- data$label[tr_idx]
-    X_va <- as.matrix(data[va_idx, ..feat_set])
-    y_va <- data$label[va_idx]
+  all_preds <- list()
+  per_fold  <- list()
+  cv_curves <- list()
+  best_rounds <- list()
 
-    bst <- xgboost::xgboost(
-      data             = X_tr,
-      label            = y_tr,
+  for (ct in heldouts) {
+    cat(sprintf("\nHeld-out cell type: %s\n", ct))
+
+    test_idx  <- data[[LOO_colname]] == ct
+    train_idx <- !test_idx
+
+    X_train <- as.matrix(data[train_idx, ..feat_set])
+    y_train <- data$label[train_idx]
+    X_test  <- as.matrix(data[test_idx, ..feat_set])
+    y_test  <- data$label[test_idx]
+
+    # chromosome folds
+    chrs_train <- data$chr[train_idx]
+    folds <- split(seq_along(chrs_train), chrs_train)
+
+    dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+
+    # --- CV for best nrounds ---
+    cv <- xgb.cv(
+      data = dtrain,
+      folds = folds,
       max_depth        = 6,
       eta              = 0.05,
       gamma            = 10,
       min_child_weight = 6,
       subsample        = 0.8,
       colsample_bytree = 1.0,
-      nrounds          = 1000,
-      nthread          = 2,
+      nrounds          = 500,
+      nthread          = 8,
       objective        = "binary:logistic",
-      eval_metric      = "auc",
-      verbose          = 1
+      eval_metric      = "aucpr",
+      early_stopping_rounds = 5,
+      verbose = 0
+    )
+
+    best_nrounds <- cv$best_iteration
+    best_rounds[[ct]] <- best_nrounds
+    cat(sprintf("Best nrounds: %d\n", best_nrounds))
+
+    # --- Train final model ---
+    bst <- xgboost(
+      data             = dtrain,
+      max_depth        = 6,
+      eta              = 0.05,
+      gamma            = 10,
+      min_child_weight = 6,
+      subsample        = 0.8,
+      colsample_bytree = 1.0,
+      nrounds          = best_nrounds,
+      nthread          = 8,
+      objective        = "binary:logistic",
+      eval_metric      = "aucpr",
+      verbose          = 0
     )
 
     if (save_models) {
-      xgboost::xgb.save(bst, file.path(model_dir, sprintf("xgb_locto_%s_%s.model", tag, h)))
+      safe_ct <- gsub("[^A-Za-z0-9]+", "_", ct)
+      model_path <- file.path(model_dir, sprintf("xgb_locto_%s_%s.model", tag, safe_ct))
+      xgb.save(bst, model_path)
     }
 
-    p_hat <- predict(bst, X_va)
-    mets  <- score_fold(y_va, p_hat)  
-    cbind(data.table(heldout = h, n_val = length(y_va), run_tag = tag), mets)
-  }))
+    # --- Predict on held-out CT ---
+    p_hat <- predict(bst, X_test)
+    all_preds[[ct]] <- data.table(
+      heldout = ct,
+      data[test_idx, ..index_cols],
+      xgBoost_probability = p_hat,
+      label = y_test
+    )
+
+    # --- Metrics ---
+    mets <- score_fold(
+      y_true = y_test,
+      p_hat  = p_hat,
+      peaks  = data$peak[test_idx],
+      restrict_peaks = restrict_peaks
+    )
+
+    per_fold[[ct]] <- cbind(
+      data.table(heldout = ct, n_val = length(y_test), run_tag = tag),
+      mets
+    )
+
+    # --- Store CV curves ---
+    e <- cv$evaluation_log
+    e$celltype <- ct
+    cv_curves[[ct]] <- e
+  }
+
+  per_fold <- rbindlist(per_fold)
+  preds    <- rbindlist(all_preds)
+  eval_log <- rbindlist(cv_curves)
 
   summary <- per_fold[, .(
     auprc   = mean(auprc,   na.rm = TRUE),
@@ -177,8 +283,15 @@ run_locto <- function(feat_set, tag = "baseline", save_models = TRUE) {
     logloss = mean(logloss, na.rm = TRUE)
   )]
 
-  list(per_fold = per_fold, summary = summary)
+  list(
+    per_fold  = per_fold,
+    summary   = summary,
+    preds     = preds,
+    cv_curves = eval_log,
+    best_rounds = best_rounds
+  )
 }
+
 ```
 
 # 8. Run Baseline
@@ -187,6 +300,8 @@ cat("Training baseline with", length(baseline_feats), "features …\n")
 base_run <- run_locto(baseline_feats, tag = "base", save_models = TRUE)
 print(base_run$summary)
 fwrite(base_run$per_fold, file.path(model_dir, "baseline_per_fold.tsv"), sep = "\t")
+fwrite(base_run$preds,    file.path(model_dir, "baseline_predictions.tsv"), sep = "\t")
+fwrite(base_run$cv_curves,file.path(model_dir, "baseline_cv.tsv"), sep = "\t")
 
 ```
 
@@ -195,50 +310,79 @@ fwrite(base_run$per_fold, file.path(model_dir, "baseline_per_fold.tsv"), sep = "
 ablation_rows <- lapply(names(groups), function(g) {
   drop <- groups[[g]]
   keep <- setdiff(baseline_feats, drop)
+
   runG <- run_locto(keep, tag = paste0("drop_", g), save_models = TRUE)
 
-  # paired deltas by the same held-out cell type
+  # --- Save detailed outputs ---
+  fwrite(runG$per_fold,  file.path(model_dir, sprintf("per_fold_%s.tsv", g)), sep = "\t")
+  fwrite(runG$preds,     file.path(model_dir, sprintf("predictions_%s.tsv", g)), sep = "\t")
+  fwrite(runG$cv_curves, file.path(model_dir, sprintf("cv_curves_%s.tsv", g)), sep = "\t")
+
+  # --- Paired deltas with baseline ---
   d_per_fold <- merge(
-    runG$per_fold[, .(heldout, auprc_ab=auprc, auc_ab=auc, logloss_ab=logloss)],
-    base_run$per_fold[, .(heldout, auprc_base=auprc, auc_base=auc, logloss_base=logloss)],
+    runG$per_fold[, .(heldout,
+                      auprc_ab = auprc, auc_ab = auc, logloss_ab = logloss,
+                      enrich_glob_ab = avg_enrichment_global,
+                      enrich_restr_ab = avg_enrichment_restrict)],
+    base_run$per_fold[, .(heldout,
+                          auprc_base = auprc, auc_base = auc, logloss_base = logloss,
+                          enrich_glob_base = avg_enrichment_global,
+                          enrich_restr_base = avg_enrichment_restrict)],
     by = "heldout"
   )[, .(
-    d_auprc   = auprc_ab   - auprc_base,
-    d_auc     = auc_ab     - auc_base,
-    d_logloss = logloss_ab - logloss_base
+    d_auprc            = auprc_ab   - auprc_base,
+    d_auc              = auc_ab     - auc_base,
+    d_logloss          = logloss_ab - logloss_base,
+    d_enrich_global    = enrich_glob_ab  - enrich_glob_base,
+    d_enrich_restrict  = enrich_restr_ab - enrich_restr_base
   )]
 
   data.table(
-    group    = g,
-    n_drop   = length(drop),
-    n_keep   = length(keep),
-    auprc    = runG$summary$auprc,
-    auc      = runG$summary$auc,
-    logloss  = runG$summary$logloss,
-    d_auprc  = mean(d_per_fold$d_auprc,   na.rm = TRUE),
-    d_auc    = mean(d_per_fold$d_auc,     na.rm = TRUE),
-    d_logloss= mean(d_per_fold$d_logloss, na.rm = TRUE)
+    group                = g,
+    n_drop               = length(drop),
+    n_keep               = length(keep),
+    auprc                = runG$summary$auprc,
+    auc                  = runG$summary$auc,
+    logloss              = runG$summary$logloss,
+    avg_enrich_global    = mean(runG$per_fold$avg_enrichment_global,   na.rm = TRUE),
+    avg_enrich_restrict  = mean(runG$per_fold$avg_enrichment_restrict, na.rm = TRUE),
+    d_auprc              = mean(d_per_fold$d_auprc,           na.rm = TRUE),
+    d_auc                = mean(d_per_fold$d_auc,             na.rm = TRUE),
+    d_logloss            = mean(d_per_fold$d_logloss,         na.rm = TRUE),
+    d_enrich_global      = mean(d_per_fold$d_enrich_global,   na.rm = TRUE),
+    d_enrich_restrict    = mean(d_per_fold$d_enrich_restrict, na.rm = TRUE)
   )
 })
 
 ablation_tbl <- rbindlist(ablation_rows)[order(d_auprc)]
 print(ablation_tbl)
 
-# Save table
 fwrite(ablation_tbl, file.path(model_dir, "ablation_summary.tsv"), sep = "\t")
+
+
 ```
 
 # 10. Plot
 ```{r}
-p <- ggplot(ablation_tbl, aes(x = reorder(group, d_auprc), y = d_auprc)) +
-  geom_col() +
+ablation_tbl
+
+p_glob <- ggplot(ablation_tbl, aes(x = reorder(group, d_enrich_global), y = d_enrich_global)) +
+  geom_col(fill = "steelblue") +
   geom_hline(yintercept = 0, linetype = 2) +
   coord_flip() +
-  labs(x = "Feature group removed", y = "ΔAUPRC vs baseline (paired)") +
+  labs(x = "Feature group removed", y = "Δ Average Enrichment (global)") +
   theme_bw(base_size = 12)
 
-print(p)
-ggsave(file.path(model_dir, "ablation_delta_auprc.png"), p, width = 6, height = 4, dpi = 300)
+p_restr <- ggplot(ablation_tbl, aes(x = reorder(group, d_enrich_restrict), y = d_enrich_restrict)) +
+  geom_col(fill = "darkred") +
+  geom_hline(yintercept = 0, linetype = 2) +
+  coord_flip() +
+  labs(x = "Feature group removed", y = "Δ Average Enrichment (restricted SNPs)") +
+  theme_bw(base_size = 12)
+
+ggsave(file.path(model_dir, "ablation_delta_enrichment_global.png"), p_glob, width = 6, height = 4, dpi = 300)
+ggsave(file.path(model_dir, "ablation_delta_enrichment_restricted.png"), p_restr, width = 6, height = 4, dpi = 300)
+
 
 ```
 

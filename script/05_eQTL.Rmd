@@ -1,0 +1,351 @@
+---
+title: "04_eQTL.Rmd"
+author: "tobiasmohl"
+date: "2025-07-28"
+output: html_document
+---
+
+# 1. Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+library(EnsDb.Hsapiens.v86)
+library(GenomicRanges)
+library(rtracklayer)
+library(Signac)
+library(Seurat)
+library(future)
+library(Matrix)
+library(HDF5Array)
+library(data.table)
+library(GenomeInfoDb)})
+
+plan("multicore", workers = 4)
+
+SCRIPT_DIR <- getwd()   
+PROJECT_ROOT <- file.path(SCRIPT_DIR, "..")                     
+DATA_DIR      <- file.path(PROJECT_ROOT, "data")
+EQTL_DIR  <- file.path(DATA_DIR, "eqtl_files")
+dir.create(EQTL_DIR, showWarnings = FALSE)
+```
+
+# 2. Load Existing Seurat
+```{r}
+seo <- readRDS(file.path(DATA_DIR, "seo_RNA_ATAC_chr123.rds"))
+peaks <- readRDS(file.path(DATA_DIR, "consensus_peak_set.rds"))
+
+barcodes <- colnames(seo)
+```
+
+# 3. eQTL
+## Download eQTL's
+```{r}
+cell_types_eqtl <- c("Ast", "End", "Ext", "IN", "MG", "OD", "OPC")  
+base_url <- "https://zenodo.org/records/14908182/files"
+files <- paste0(cell_types_eqtl, "_eqtl_full_assoc.tsv.gz")
+
+options(timeout = max(300, getOption("timeout")))
+for (f in files) {
+  dest <- file.path(EQTL_DIR, f)
+  if (!file.exists(dest)) {
+    url <- paste0(base_url, "/", f, "?download=1")
+    message("Downloading ", f, " ...")
+    try(download.file(url, destfile = dest, mode = "wb"))
+  }
+}
+```
+
+## Candidate Links
+```{r}
+labels <- c("astrocytes","endothelial","Neurons","Microglia","Oligodendrocytes","OPC", "Tcells", "Other")  
+
+GenomeInfoDb::seqlevelsStyle(peaks) <- "UCSC"
+peaks <- peaks[as.character(seqnames(peaks)) %in% c("chr1","chr2","chr3")]
+mcols(peaks)$peak <- sprintf("%s-%d-%d", as.character(seqnames(peaks)), start(peaks), end(peaks))
+peak_tbl <- data.table(peak=mcols(peaks)$peak,
+                       chr=as.character(seqnames(peaks)),
+                       start=as.integer(start(peaks)),
+                       end=as.integer(end(peaks)))[, mid := (start+end)%/%2L]
+
+ensdb <- EnsDb.Hsapiens.v86
+genes_db <- genes(ensdb, filter = ~ gene_biotype == "protein_coding")
+tss_pos <- ifelse(strand(genes_db)=="+", start(genes_db), end(genes_db))
+gr_tss <- GRanges(seqnames=seqnames(genes_db), ranges=IRanges(tss_pos, width=1),
+                  strand=strand(genes_db), gene_id=genes_db$gene_id)
+GenomeInfoDb::seqlevelsStyle(gr_tss) <- "UCSC"
+gr_tss <- keepStandardChromosomes(gr_tss, pruning.mode="coarse")
+
+# link & promoter ranges (TSS-centered)
+link_kb <- 500; prom_kb <- 1
+gr_link <- promoters(gr_tss, upstream=link_kb*1000, downstream=link_kb*1000)
+mcols(gr_link)$gene_id <- mcols(gr_tss)$gene_id
+gr_prom <- promoters(gr_tss, upstream=prom_kb*1000, downstream=prom_kb*1000)
+
+# promoter-peak mask 
+ov_prom <- findOverlaps(peaks, gr_prom, ignore.strand=TRUE)
+prom_peaks <- unique(mcols(peaks)$peak[queryHits(ov_prom)])
+
+# SNP universe for mapping
+eqtl_to_snp_string <- function(chr, pos) sprintf("%s-%d-%d", chr, as.integer(pos)-1L, as.integer(pos))
+
+stopifnot("cell_type_manual" %in% colnames(seo@meta.data))
+seo <- subset(seo, cells = rownames(seo@meta.data)[seo@meta.data$cell_type_manual %in% labels])
+seo@meta.data$cell_type_manual <- factor(seo@meta.data$cell_type_manual, levels=labels)
+
+DefaultAssay(seo) <- "ATAC"
+atac <- GetAssayData(seo, "ATAC", "counts")
+if (any(grepl(":", rownames(atac)))) {
+  rn <- gsub(":", "-", rownames(atac))
+  rn <- gsub("(chr\\w+)-(\\d+)-(\\d+)", "\\1-\\2-\\3", rn)
+  rownames(atac) <- rn
+}
+DefaultAssay(seo) <- "RNA"
+rna <- GetAssayData(seo, "RNA", "counts")
+
+min_peak_frac <- 0.05
+min_gene_frac <- 0.05
+
+make_ct_labels <- function(ct_code, ct_file_codes) {
+  message("CT: ", ct_code)
+
+  cells <- rownames(seo@meta.data)[seo@meta.data$cell_type_manual == ct_code]
+  stopifnot(length(cells) > 0)
+
+  # Peaks present in CT
+  atac_ct <- atac[, cells, drop = FALSE]
+  keep_peaks <- rownames(atac_ct)[Matrix::rowMeans(atac_ct > 0) >= min_peak_frac]
+  keep_peaks <- intersect(keep_peaks, peak_tbl$peak)
+
+  # Genes present in CT (symbols in Seurat, map → ENSG)
+  rna_ct <- rna[, cells, drop = FALSE]
+  gene_present <- rownames(rna_ct)[Matrix::rowMeans(rna_ct > 0) >= min_gene_frac]
+
+  if (!all(grepl("^ENSG", gene_present))) {
+    map <- AnnotationDbi::select(ensdb, keys = unique(gene_present),
+                                 keytype = "SYMBOL", columns = "GENEID")
+    map <- unique(map[!is.na(map$GENEID), ])
+    gene_present_ensg <- unique(map$GENEID)
+  } else {
+    gene_present_ensg <- unique(gene_present)
+  }
+
+  peaks_ct  <- peaks[mcols(peaks)$peak %in% keep_peaks]
+  gr_tss_ct <- gr_tss[mcols(gr_tss)$gene_id %in% gene_present_ensg]
+  if (length(peaks_ct) == 0L || length(gr_tss_ct) == 0L) {
+    message("  No peaks or genes for ", ct_code)
+    return(NULL)
+  }
+
+  # TSS-centered candidate (peak,gene) within ±link_kb, minus promoter peaks
+  gr_link_ct <- promoters(gr_tss_ct, upstream = link_kb*1000, downstream = link_kb*1000)
+  mcols(gr_link_ct)$gene_id <- mcols(gr_tss_ct)$gene_id
+  ov_ct <- findOverlaps(peaks_ct, gr_link_ct, ignore.strand = TRUE)
+  cand <- unique(data.table(
+    peak_id = mcols(peaks_ct)$peak[queryHits(ov_ct)],         # "chr-start-end"
+    gene_id = mcols(gr_link_ct)$gene_id[subjectHits(ov_ct)]
+  ))
+  cand <- cand[!peak_id %in% prom_peaks]
+
+  cand <- merge(cand, peak_tbl[, .(peak_id = peak, mid, chr)], by = "peak_id", all.x = TRUE)
+  tss_dt <- as.data.table(gr_tss_ct)[, .(gene_id, chr = as.character(seqnames), tss = start)]
+  cand <- merge(cand, tss_dt, by = c("gene_id","chr"), all.x = TRUE)
+  cand[, peak_gene_distance := abs(mid - tss)]
+  cand <- cand[peak_gene_distance < link_kb*1000][, c("mid","tss") := NULL]
+
+  # read & combine eQTLs for this CT 
+  read_one <- function(code) {
+    path <- file.path(EQTL_DIR, paste0(code, "_eqtl_full_assoc.tsv.gz"))
+    if (!file.exists(path)) {
+      message("  Missing eQTL file: ", basename(path))
+      return(NULL)
+    }
+    fread(path, select = c("feature","variant_id","Fixed_P","chr","pos"))
+  }
+  eqtl_list <- lapply(ct_file_codes, read_one)
+  eqtl_list <- Filter(Negate(is.null), eqtl_list)
+  if (!length(eqtl_list)) return(NULL)
+
+  eqtl <- rbindlist(eqtl_list, use.names = TRUE, fill = TRUE)
+  eqtl[, gene_id := sub("\\..*", "", feature)]
+  if (!all(grepl("^chr", eqtl$chr))) eqtl[, chr := paste0("chr", chr)]
+
+  # labeling rule
+  power_cutoff <- 1e-6; neg_cutoff <- 0.4; strong_cut <- 0.01
+  strong <- eqtl[Fixed_P < strong_cut]
+  eqtl[, label := fifelse(Fixed_P < power_cutoff, 1L,
+                   fifelse(Fixed_P > neg_cutoff &
+                           variant_id %in% strong$variant_id &
+                           gene_id   %in% strong$gene_id, 2L, 3L))]
+
+  # SNP→peak overlaps on the full peak set (we’ll restrict by cand via join)
+  snp_gr <- GRanges(seqnames = eqtl$chr, ranges = IRanges(eqtl$pos, width = 1))
+  hits <- findOverlaps(snp_gr, peaks, ignore.strand = TRUE)
+  if (length(hits) == 0L) return(NULL)
+
+  peak_id_vec <- sprintf("%s-%d-%d",
+                         as.character(seqnames(peaks))[subjectHits(hits)],
+                         start(peaks)[subjectHits(hits)],
+                         end(peaks)[subjectHits(hits)])
+
+  snppg <- data.table(
+    variant_id = eqtl$variant_id[queryHits(hits)],
+    chr        = eqtl$chr       [queryHits(hits)],
+    pos        = eqtl$pos       [queryHits(hits)],
+    gene_id    = eqtl$gene_id   [queryHits(hits)],
+    Fixed_P    = eqtl$Fixed_P   [queryHits(hits)],
+    label      = eqtl$label     [queryHits(hits)],
+    peak_id    = peak_id_vec    
+  )
+
+  # keep only CT-specific (peak,gene) pairs
+  setkey(snppg, peak_id, gene_id)
+  setkey(cand,   peak_id, gene_id)
+  snppg <- snppg[cand, nomatch = 0]
+
+  if (nrow(snppg) == 0L) {
+    message("  No SNP–peak–gene matches after filtering for ", ct_code)
+    return(NULL)
+  }
+
+  snppg[, peak := peak_id]                      
+  snppg[, snp  := sprintf("%s-%d-%d", chr, as.integer(pos) - 1L, as.integer(pos))]
+  snppg[, celltype := ct_code]
+
+  # Ensembl → symbol
+  sym <- AnnotationDbi::select(ensdb, keys = unique(snppg$gene_id),
+                               keytype = "GENEID", columns = "SYMBOL")
+  sym <- unique(data.table(gene_id = sym$GENEID, gene = sym$SYMBOL))
+  setkey(sym, gene_id); setkey(snppg, gene_id)
+  snppg <- sym[snppg]
+  snppg[is.na(gene) | gene == "", gene := gene_id]
+
+  # if the same (snp,peak,gene) appears multiple times (because Ext+IN),
+  # keep the "best" label (1 < 2 < 3)
+  setorder(snppg, label)
+  snppg <- snppg[, .SD[1L], by = .(snp, peak, gene, celltype)]
+
+  snppg[, .(snp, peak, gene, celltype, label, variant_id, chr, pos)]
+}
+ct_map <- data.table(
+  ct_code   = c("astrocytes","endothelial","Microglia","Oligodendrocytes","OPC","Neurons","Neurons"),
+  eqtl_name = c("Ast","End","MG","OD","OPC","Ext","IN")
+)
+
+all_lab <- rbindlist(lapply(seq_len(nrow(ct_map)), function(i)
+  make_ct_labels(ct_map$ct_code[i], ct_map$eqtl_name[i])),
+  use.names = TRUE, fill = TRUE)
+
+fwrite(all_lab, file.path(EQTL_DIR, "training_data_snppg_CTspecific_TSScentered_chr123_2.tsv.gz"), sep="\t")
+
+```
+
+```{r}
+
+suppressPackageStartupMessages(library(data.table))
+
+qc_eqtl_labeling_all_cts <- function(
+  seo,
+  all_lab,
+  ct_col = "cell_type_manual",
+  min_peak_frac = 0.05,       
+  min_peak_frac_other = 0.02  
+) {
+  stopifnot(ct_col %in% colnames(seo@meta.data))
+  stopifnot(all(c("peak","celltype") %in% names(all_lab)))
+
+  ## ATAC counts with normalized peak names "chr-start-end"
+  DefaultAssay(seo) <- "ATAC"
+  atac <- GetAssayData(seo, assay = "ATAC", slot = "counts")
+  if (any(grepl(":", rownames(atac)))) {
+    rn <- gsub(":", "-", rownames(atac))
+    rn <- gsub("(chr\\w+)-(\\d+)-(\\d+)", "\\1-\\2-\\3", rn)
+    rownames(atac) <- rn
+  }
+
+  ## Keep only peaks present in both ATAC and labels (avoids name-mismatch noise)
+  all_lab <- as.data.table(all_lab)
+  all_lab <- all_lab[peak %in% rownames(atac)]
+
+  ## Cell types present in BOTH objects
+  cts_atac <- sort(unique(seo@meta.data[[ct_col]]))
+  cts_lbl  <- sort(unique(all_lab$celltype))
+  cts <- intersect(cts_atac, cts_lbl)
+  if (!length(cts)) stop("No overlapping cell types between Seurat (", ct_col, ") and all_lab$celltype.")
+
+  ## Fraction-of-cells open per peak per CT
+  frac_open <- sapply(cts, function(ct) {
+    cells <- rownames(seo@meta.data)[seo@meta.data[[ct_col]] == ct]
+    if (length(cells) == 0) return(rep(0, nrow(atac)))
+    Matrix::rowMeans(atac[, cells, drop = FALSE] > 0)
+  })
+  rownames(frac_open) <- rownames(atac)
+
+  per_ct <- vector("list", length(cts)); names(per_ct) <- cts
+  offending_exclusive <- vector("list", length(cts)); names(offending_exclusive) <- cts
+  examples <- vector("list", length(cts)); names(examples) <- cts
+
+  for (ct in cts) {
+    # peaks “open in CT”
+    open_ct <- rownames(atac)[frac_open[, ct] > min_peak_frac]
+
+    # peaks “open in any other CT”
+    others <- setdiff(cts, ct)
+    also_open_elsewhere <- if (length(others)) {
+      rownames(atac)[apply(frac_open[, others, drop = FALSE] > min_peak_frac_other, 1, any)]
+    } else character(0)
+
+    excl <- setdiff(open_ct, also_open_elsewhere)
+    shrd <- intersect(open_ct, also_open_elsewhere)
+
+    # 1) Leakage on exclusive peaks: any labels whose celltype != ct
+    leak_rows <- all_lab[peak %chin% excl & celltype != ct]
+    offending_exclusive[[ct]] <- leak_rows
+
+    # 2) Shared peaks must include labels for this CT (presence check)
+    peaks_labeled_by_ct <- all_lab[celltype == ct, unique(peak)]
+    n_shared_without_ct_label <- sum(!(shrd %chin% peaks_labeled_by_ct))
+
+    # 3) Compact per-CT summary
+    per_ct[[ct]] <- data.table(
+      celltype = ct,
+      n_open = length(open_ct),
+      n_exclusive = length(excl),
+      n_shared = length(shrd),
+      frac_shared = if (length(open_ct)) round(length(shrd)/length(open_ct), 3) else NA_real_,
+      n_offending_exclusive_rows = nrow(leak_rows),
+      n_offending_exclusive_peaks = uniqueN(leak_rows$peak),
+      n_shared_without_CT_label = n_shared_without_ct_label
+    )
+
+    # 4) a tiny example set to eyeball
+    examples[[ct]] <- list(
+      exclusive_example = head(all_lab[peak %chin% excl & celltype == ct], 5),
+      shared_examples   = head(all_lab[peak %chin% shrd][order(peak, celltype)], 10),
+      leakage_example   = head(leak_rows, 10)
+    )
+  }
+
+  list(
+    summary = rbindlist(per_ct, use.names = TRUE),
+    offending_exclusive = offending_exclusive,
+    examples = examples,
+    frac_open = frac_open  # returned in case you want to tune thresholds afterwards
+  )
+}
+
+qc <- qc_eqtl_labeling_all_cts(
+  seo, all_lab,
+  ct_col = "cell_type_manual",
+  min_peak_frac = 0.00,
+  min_peak_frac_other = 0.00
+)
+
+# High-level table
+qc$summary[order(-n_exclusive)]
+# Peek at any leakage (should be 0 rows per CT ideally)
+lapply(qc$offending_exclusive, nrow)
+```
+
+
+

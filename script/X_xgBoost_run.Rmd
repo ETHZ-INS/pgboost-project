@@ -24,11 +24,11 @@ XGB_DIR    <- file.path(OUTPUT_DIR, "xgBoost_outputs")
 MODEL_DIR  <- file.path(XGB_DIR, "models")
 PRED_DIR   <- file.path(XGB_DIR, "predictions")
 
-run_name <- "xgBoost_loco_n1000_pgBoostFeatures_test"
+run_name <- "xgBoost_loco_n1000_LOCO_aggregated"
 
-data_file      <- file.path(XGB_DIR, "data.tsv")
-training_file  <- file.path(PROJECT_ROOT, "data", "eqtl_files", "training_data_snppg_ALL_chr123.tsv.gz")
-predictor_file <- file.path(XGB_DIR, "predictors.txt")
+data_file      <- file.path(XGB_DIR, "data_aggregated.tsv")
+training_file  <- file.path(PROJECT_ROOT, "data", "eqtl_files", "training_data_snppg_aggregated.tsv.gz")
+predictor_file <- file.path(XGB_DIR, "predictors_aggregated.txt")
 
 model_dir <- file.path(MODEL_DIR, run_name)
 pred_dir  <- file.path(PRED_DIR,  run_name)
@@ -37,48 +37,6 @@ dir.create(pred_dir,  recursive = TRUE, showWarnings = FALSE)
 
 feat_out <- file.path(model_dir, "feature_names.txt")
 outfile  <- file.path(pred_dir, paste0(run_name, ".tsv"))
-```
-
-```{r}
-full_data <- fread(data_file)
-training_data <- fread(training_file)
-
-diag_overlap_cols <- function(full_data, training_data,
-                              cols = c("peak","gene","celltype","snp","chr")) {
-  res <- rbindlist(lapply(cols, function(col) {
-    fd_v <- full_data[[col]]
-    td_v <- training_data[[col]]
-
-    # NA counts (before coercion)
-    na_full  <- sum(is.na(fd_v))
-    na_train <- sum(is.na(td_v))
-
-    # Deduplicate uniques (exclude NA for overlap calc)
-    fd_dt <- unique(data.table(v = trimws(as.character(fd_v[!is.na(fd_v)]))))
-    td_dt <- unique(data.table(v = trimws(as.character(td_v[!is.na(td_v)]))))
-    setkey(fd_dt, v); setkey(td_dt, v)
-
-    ov <- nrow(fintersect(fd_dt, td_dt))
-
-    data.table(
-      column        = col,
-      full_unique   = nrow(fd_dt),
-      train_unique  = nrow(td_dt),
-      overlap       = ov,
-      pct_of_full   = round(100 * ov / max(1, nrow(fd_dt)), 2),
-      pct_of_train  = round(100 * ov / max(1, nrow(td_dt)), 2),
-      na_full       = na_full,
-      na_train      = na_train
-    )
-  }))
-  print(res)
-  invisible(res)
-}
-
-# Usage:
-index_cols <- c("peak","gene","celltype","snp","chr")
-diag_overlap_cols(full_data, training_data, cols = index_cols)
-
 ```
 
 ```{r}
@@ -97,7 +55,7 @@ training_data[, celltype := ifelse(celltype %in% names(ct_map),
                                    ct_map[celltype], celltype)]
 
 # Merge on full identity
-index_cols <- c("peak", "gene", "celltype", "snp", "chr")
+index_cols <- c("peak", "gene", "celltype")
 setkeyv(full_data, index_cols)
 setkeyv(training_data, index_cols)
 data <- full_data[training_data, nomatch = 0L]
@@ -112,7 +70,7 @@ cat(sprintf("Number of negatives: %s\n\n", sum(data$label == 0L)))
 
 # Predictors
 predictors <- scan(predictor_file, what = character(), quiet = TRUE)
-predictors <- c("snp_gene_distance", "closest_tss", "cicero", "scent", "signac")
+#predictors <- c("snp_gene_distance", "closest_tss", "cicero", "scent", "signac")
 pred_cols  <- intersect(predictors, names(data))
 stopifnot(length(pred_cols) > 0)
 cat(sprintf("Using %d features for model training and prediction.\n\n", length(pred_cols)))
@@ -136,8 +94,11 @@ for (chr in chromosomes) {
   cat(sprintf("Chromosome %s:\n", chr))
 
   # Off-chromosome
+  drop_cols <- c("peak", "celltype", "gene", "snp")
+  pred_cols <- setdiff(names(annotation_feature_tabb), drop_cols)
+  
   train_idx <- data[[LOO_colname]] != chr
-  X_train   <- as.matrix(annotation_feature_tabb[train_idx, , drop = FALSE])
+  X_train   <- as.matrix(annotation_feature_tabb[train_idx, ..pred_cols , drop = FALSE])
   y_train   <- labels[train_idx]
 
   cat(sprintf("Number of training instances: %s\n", length(y_train)))
@@ -155,7 +116,7 @@ for (chr in chromosomes) {
     subsample        = 0.8,
     colsample_bytree = 1.0,
     nrounds          = 1000,
-    nthread          = 2,
+    nthread          = 8,
     objective        = "binary:logistic",
     eval_metric      = "auc",
     verbose          = 1

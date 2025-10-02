@@ -1,0 +1,175 @@
+---
+title: "X_xgBoost_noLOCTO_run.Rmd"
+author: "tobiasmohl"
+date: "2025-09-24"
+output: html_document
+---
+
+# 1. Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(xgboost)
+  library(dplyr)
+})
+
+set.seed(187)
+
+SCRIPT_DIR   <- getwd()
+PROJECT_ROOT <- normalizePath(file.path(SCRIPT_DIR, ".."), mustWork = FALSE)
+
+OUTPUT_DIR <- file.path(PROJECT_ROOT, "output")
+XGB_DIR    <- file.path(OUTPUT_DIR, "xgBoost_outputs")
+MODEL_DIR  <- file.path(XGB_DIR, "models")
+PRED_DIR   <- file.path(XGB_DIR, "predictions")
+
+run_name <- "xgBoost_aggregated_noLOCTO"
+
+data_file      <- file.path(XGB_DIR, "data_aggregated.tsv")
+training_file  <- file.path(PROJECT_ROOT, "data", "eqtl_files", "training_data_snppg_aggregated.tsv.gz")
+predictor_file <- file.path(XGB_DIR, "predictors_aggregated.txt")
+duplicates_file <- file.path(XGB_DIR, "drop_duplicates_aggregated.txt")
+
+model_dir <- file.path(MODEL_DIR, run_name)
+pred_dir  <- file.path(PRED_DIR,  run_name)
+dir.create(model_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(pred_dir,  recursive = TRUE, showWarnings = FALSE)
+
+feat_out <- file.path(model_dir, "feature_names.txt")
+outfile  <- file.path(pred_dir, paste0(run_name, ".tsv"))
+
+plot_path <- file.path(dirname(outfile), "cv_curves_combined.png")
+evaluationlog_path <- file.path(dirname(outfile), "evaluationlog.rds")
+```
+
+# 2. Preparation
+```{r}
+full_data <- fread(data_file)
+training_data <- fread(training_file)
+```
+
+# 3.
+```{r}
+ct_map <- c(
+  Ast = "astrocytes",
+  MG  = "Microglia",
+  OD  = "Oligodendrocytes",
+  OPC = "OPC",
+  IN  = "Neurons",     # fuse IN  → Neurons
+  Ext = "Neurons",     # fuse Ext → Neurons
+  End = "Endothelial"
+)
+
+remap_ct <- function(x) ifelse(x %in% names(ct_map), ct_map[x], x)
+
+training_data[, celltype := remap_ct(celltype)]
+full_data[,     celltype := remap_ct(celltype)]
+
+# Merge on full identity
+#index_cols <- c("peak", "gene", "celltype", "snp", "chr")
+index_cols <- c("peak", "gene", "celltype")
+setkeyv(full_data, index_cols)
+setkeyv(training_data, index_cols)
+data <- full_data[training_data, nomatch = 0L]
+
+# Labels: 1 = pos, 2 = strong neg -> make 0/1
+data[label == 2L, label := 0L]
+data <- data[label %in% c(0L, 1L)]
+
+cat(sprintf("Number of training instances: %s\n", nrow(data)))
+cat(sprintf("Number of positives: %s\n", sum(data$label == 1L)))
+cat(sprintf("Number of negatives: %s\n\n", sum(data$label == 0L)))
+
+```
+
+```{r}
+# Subset to genes with a positive link in the merged set
+positive_genes = unique(data[data$label == 1,]$gene)
+data = data[data$gene %in% positive_genes,]
+
+# Order data
+positive_set = data[data$label == 1,]
+negative_set = data[data$label == 0,]
+data = rbind(positive_set, negative_set)
+
+writeLines(sprintf("Number of training instances: %s", nrow(data)))
+writeLines(sprintf("Number of positives: %s", sum(data$label)))
+writeLines(sprintf("Number of negatives: %s\n", nrow(data) - sum(data$positive)))
+
+if (nrow(data) == 0) {
+    writeLines("No overlap between candidate links and training data! Halting.")
+    quit()
+    }
+
+# Read in names of predictors to use in model (should correspond to column names)
+predictors = read.table(predictor_file)$V1
+writeLines(sprintf("Using %s features for model training and prediction.\n", length(predictors)))
+
+# Create data matrix and training labels
+annotation_feature_tabb <- data[, ..predictors]
+labels = data$label
+
+LOO_colname <- "chr"
+
+chromosomes <- unique(full_data[[LOO_colname]])
+
+
+predictions = data.frame()
+cv_curves <- list()
+evaluation <- data.table()
+
+for (chrom in chromosomes) {
+    writeLines(sprintf("Chromosome %s:", chrom))
+    # Subset features and training labels to off-chromosome candidate links
+    training_idx = which(data[, ..LOO_colname] != chrom)
+    training_data = annotation_feature_tabb[training_idx, ]
+    training_labels = labels[training_idx]
+    writeLines(sprintf("Number of training instances: %s", length(training_labels)))
+    writeLines(sprintf("Number of positives: %s", sum(training_labels)))
+    writeLines(sprintf("Number of negatives: %s", length(training_labels) - sum(training_labels)))
+    
+    # Train pgBoost model on off-chromosome data
+    NUMITER_XGBoost=1000
+    bstSparse <-  xgboost(data = as.matrix(training_data),
+                          label = training_labels,
+                          max_depth = c(10, 15, 25),
+                          learning_rate = 0.05,
+                          gamma = 10,
+                          min_child_weight = c(6, 8, 10),
+                          nthread = 2,
+                          scale_pos_weight = 1,
+                          subsample = c(0.6, 0.8, 1),
+                          nrounds = NUMITER_XGBoost,
+                          objective = "binary:logistic",
+                          eval_metric = "auc",
+                          verbose = 0
+    )
+    
+    # Generate predictions for candidate links on the focal chromosome
+    prediction_idx = which(full_data[, ..LOO_colname] == chrom)
+    prediction_features = full_data[prediction_idx, ..predictors]
+    xgBoost_probability = predict(bstSparse, as.matrix(prediction_features))
+    chrom_predictions = cbind(full_data[prediction_idx, ..index_cols], xgBoost_probability)
+    
+    # Add predictions from focal chromosome to full set of predictions
+    predictions = rbind(predictions, chrom_predictions)
+    writeLines(sprintf("Number of scored links: %s\n", nrow(chrom_predictions)))
+    
+      # --- Store CV curves ---
+    e <- bstSparse$evaluation_log
+    e$chrom <- chrom
+    cv_curves[[chrom]] <- e
+    evaluation <- rbind(evaluation, e, fill = TRUE)
+}
+
+predictions = predictions %>% mutate(pgBoost_percentile = percent_rank(predictions$xgBoost_probability))
+
+# Save predictions to specified outfile name
+write.table(predictions, outfile, sep = "\t", row.names = F, quote = F)
+writeLines(sprintf("Total number of scored links: %s", nrow(predictions)))
+saveRDS(evaluation, evaluationlog_path)
+
+```
+

@@ -1,0 +1,368 @@
+---
+title: "X_xgBoost_hyperparameter_train.Rmd"
+author: "tobiasmohl"
+date: "2025-09-26"
+output: html_document
+---
+
+# 1. Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(xgboost)
+  library(dplyr)
+  library(mlr3)
+  library(mlr3tuning)
+  library(mlr3mbo)
+  library(paradox)
+  library(ggplot2)
+  library(PRROC)
+  library(mlr3learners)
+
+})
+
+set.seed(187)
+
+SCRIPT_DIR   <- getwd()
+PROJECT_ROOT <- normalizePath(file.path(SCRIPT_DIR, ".."), mustWork = FALSE)
+
+OUTPUT_DIR <- file.path(PROJECT_ROOT, "output")
+XGB_DIR    <- file.path(OUTPUT_DIR, "xgBoost_outputs")
+TUNING_DIR <- file.path(XGB_DIR, "tuning")
+PRED_DIR   <- file.path(XGB_DIR, "predictions")
+MODEL_DIR  <- file.path(XGB_DIR, "models")
+
+run_name <- "xgBoost_tuning_500evals_reducedParams"
+
+data_file      <- file.path(XGB_DIR, "data_aggregated.tsv")
+training_file  <- file.path(PROJECT_ROOT, "data", "eqtl_files", "training_data_snppg_aggregated_new.tsv.gz")
+predictor_file <- file.path(XGB_DIR, "predictors.txt")
+
+model_dir <- file.path(MODEL_DIR, run_name)
+pred_dir  <- file.path(PRED_DIR,  run_name)
+dir.create(model_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(pred_dir,  recursive = TRUE, showWarnings = FALSE)
+
+feat_out <- file.path(model_dir, "feature_names.txt")
+outfile  <- file.path(TUNING_DIR, run_name)
+dir.create(outfile,  recursive = TRUE, showWarnings = FALSE)
+
+```
+
+# 2. Preparation
+```{r}
+full_data <- fread(data_file)
+training_data <- fread(training_file)
+```
+
+# 3.
+```{r}
+ct_map <- c(
+  Ast = "astrocytes",
+  MG  = "Microglia",
+  OD  = "Oligodendrocytes",
+  OPC = "OPC",
+  IN  = "Neurons",     # fuse IN  → Neurons
+  Ext = "Neurons",     # fuse Ext → Neurons
+  End = "Endothelial"
+)
+
+remap_ct <- function(x) ifelse(x %in% names(ct_map), ct_map[x], x)
+
+training_data[, celltype := remap_ct(celltype)]
+full_data[,     celltype := remap_ct(celltype)]
+
+full_data[, chr := tstrsplit(peak, "-", keep = 1L)]
+training_data[, chr := tstrsplit(peak, "-", keep = 1L)]
+
+# Merge on full identity
+index_cols <- c("peak", "gene", "celltype", "chr")
+setkeyv(full_data, index_cols)
+setkeyv(training_data, index_cols)
+data <- full_data[training_data, nomatch = 0L]
+
+# Labels: 1 = pos, 2 = strong neg -> make 0/1
+data[label == 2L, label := 0L]
+data <- data[label %in% c(0L, 1L)]
+
+cat(sprintf("Number of training instances: %s\n", nrow(data)))
+cat(sprintf("Number of positives: %s\n", sum(data$label == 1L)))
+cat(sprintf("Number of negatives: %s\n\n", sum(data$label == 0L)))
+
+# Predictors
+predictors <- scan(predictor_file, what = character(), quiet = TRUE)
+feature_cols  <- intersect(predictors, names(data))
+
+celltypes <- sort(unique(data$celltype))
+
+```
+
+```{r}
+generic_params <- list(
+  booster           = "gbtree",
+  objective         = "binary:logistic",
+  eval_metric       = "aucpr",
+  eta               = 0.05,
+  max_depth         = 6,
+  gamma             = 10,
+  min_child_weight  = 6,
+  subsample         = 0.8,
+  colsample_bytree  = 1,
+  lambda            = 0,
+  alpha             = 0
+)
+```
+
+# Functions
+```{r}
+tune_xgb <- function(X, y, chr, heldout_ct, outfile = ".") {
+  df <- data.frame(X)
+  df$label <- factor(y, levels = c(0, 1))
+  df$chr   <- chr
+  
+  task <- TaskClassif$new(
+    id       = paste0("xgb_tuning_", heldout_ct),
+    backend  = df,
+    target   = "label",
+    positive = "1"
+  )
+  task$set_col_roles("chr", add_to = "group", remove_from = "feature")
+  
+  learner <- mlr3::lrn("classif.xgboost",
+    booster     = "gbtree",
+    objective   = "binary:logistic",
+    nrounds     = 120,
+    eval_metric = "aucpr",
+    predict_type = "prob"
+  )
+  learner$param_set$values$nthread <- 16
+  
+  learner$param_set$values$gamma            <- generic_params$gamma
+  learner$param_set$values$min_child_weight <- generic_params$min_child_weight
+  learner$param_set$values$subsample        <- generic_params$subsample
+  learner$param_set$values$colsample_bytree <- generic_params$colsample_bytree
+
+  paramSet <- ParamSet$new(list(
+    eta               = p_dbl(lower = 0.01,  upper = 0.3),
+    max_depth         = p_int(lower = 3,     upper = 10),
+    #gamma             = p_dbl(lower = 0,     upper = 20),
+    #min_child_weight  = p_int(lower = 1,     upper = 20),
+    #subsample         = p_dbl(lower = 0.5,   upper = 1.0),
+    #colsample_bytree  = p_dbl(lower = 0.5,   upper = 1.0),
+    lambda            = p_dbl(lower = 0,     upper = 1000),
+    alpha             = p_dbl(lower = 0,     upper = 1000)
+  ))
+  
+  measure <- msr("classif.logloss")
+
+  terminator <- mlr3tuning::trm("combo",
+                              list(mlr3tuning::trm("stagnation", iters=10, threshold=0.001),
+                                   mlr3tuning::trm("evals", n_evals=500)), any=FALSE)
+  rs <- rsmp("loo")
+  rs$instantiate(task)
+  
+
+  inst <- mlr3tuning::ti(task=task,
+                           learner=learner,
+                           resampling=rs,
+                           measure=measure,
+                           search_space=paramSet,
+                           terminator=terminator)
+  tuner <- TunerMbo$new()
+  tuner$optimize(inst)
+  
+  saveRDS(inst, file.path(outfile, paste0("tuning_instance_", heldout_ct, ".rds")))
+  
+  return(inst$result_learner_param_vals)
+}
+
+train_xgb <- function(X, y, params, folds, max_nrounds = 500) {
+  # remove problematic keys from tuned params
+  params$nrounds    <- NULL
+  params$nthread    <- NULL
+  params$objective  <- NULL
+  params$eval_metric <- NULL
+  
+  # set the ones you actually want
+  params$objective   <- "binary:logistic"
+  params$eval_metric <- "aucpr"
+  
+  dtrain <- xgb.DMatrix(as.matrix(X), label = y)
+  
+  # CV to find best nrounds
+  cv <- xgb.cv(
+    data = dtrain,
+    params = params,
+    nrounds = max_nrounds,
+    folds = folds,
+    nthread = 8,
+    early_stopping_rounds = 10,
+    verbose = 1
+  )
+  
+  best_nrounds <- cv$best_iteration
+  
+  # Final training
+  bst <- xgb.train(
+    params  = params,
+    data    = dtrain,
+    nrounds = best_nrounds,
+    nthread = 8,
+    verbose = 1
+  )
+  
+  return(list(model = bst, best_nrounds = best_nrounds))
+}
+
+predict_and_score <- function(model_obj, X_test, y_test) {
+  bst <- if (is.list(model_obj)) model_obj$model else model_obj
+  p_hat <- predict(bst, as.matrix(X_test))
+  
+  logloss <- -mean(y_test*log(p_hat + 1e-15) + (1-y_test)*log(1 - p_hat + 1e-15))
+  
+  pr <- PRROC::pr.curve(scores.class0 = p_hat[y_test==1],
+                        scores.class1 = p_hat[y_test==0],
+                        curve = FALSE)
+  
+  return(list(
+    preds = data.table(prob = p_hat, label = y_test),
+    metrics = list(logloss = logloss, auprc = pr$auc.integral)
+  ))
+}
+
+
+
+```
+
+```{r}
+results <- list()
+
+for (ct in celltypes) {
+  message("Held-out cell type: ", ct)
+  
+  # --- Split ---
+  train_idx <- data$celltype != ct
+  test_idx  <- data$celltype == ct
+  
+  X_train <- data[train_idx, ..feature_cols]
+  y_train <- data$label[train_idx]
+  chr_train <- data$chr[train_idx]
+  
+  X_test <- data[test_idx, ..feature_cols]
+  y_test <- data$label[test_idx]
+  
+  # --- Tuning ---
+  tuned_params <- tune_xgb(
+    X_train, y_train, chr_train,
+    heldout_ct = ct, outfile = outfile
+  )
+  
+  # --- Training ---
+  # chromosome folds
+  chrs_train <- data$chr[train_idx]
+  folds <- split(seq_along(chrs_train), chrs_train)
+  
+  message("training generic model")
+  generic_model <- train_xgb(X_train, y_train, generic_params, folds = folds, max_nrounds = 500)
+  
+  message("training tuned model")
+  tuned_model   <- train_xgb(X_train, y_train, tuned_params,   folds = folds, max_nrounds = 500)
+  
+  xgb.save(generic_model$model,
+         fname = file.path(model_dir, paste0("xgb_generic_", ct, ".model")))
+
+  xgb.save(tuned_model$model,
+           fname = file.path(model_dir, paste0("xgb_tuned_", ct, ".model")))
+
+  # --- Predict + score ---
+  res_generic <- predict_and_score(generic_model, X_test, y_test)
+  res_tuned   <- predict_and_score(tuned_model,   X_test, y_test)
+  
+  # --- Save predictions ---
+  # Add metadata columns: heldout cell type, model type
+  preds_generic <- cbind(celltype = ct, model = "generic", res_generic$preds)
+  preds_tuned   <- cbind(celltype = ct, model = "tuned",   res_tuned$preds)
+  
+  data.table::fwrite(
+    preds_generic,
+    file = file.path(pred_dir, paste0("predictions_generic_", ct, ".tsv")),
+    sep = "\t"
+  )
+  data.table::fwrite(
+    preds_tuned,
+    file = file.path(pred_dir, paste0("predictions_tuned_", ct, ".tsv")),
+    sep = "\t"
+  )
+  
+  # --- Collect summary metrics ---
+  results[[ct]] <- list(
+    tuned_params = tuned_params,
+    generic = res_generic$metrics,
+    tuned   = res_tuned$metrics
+  )
+}
+
+# Save all summary metrics
+saveRDS(results, file = file.path(pred_dir, "summary_metrics.rds"))
+
+```
+
+```{r}
+# read all predictions back in
+pred_files <- list.files(pred_dir, pattern = "^predictions_.*\\.tsv$", full.names = TRUE)
+all_preds  <- rbindlist(lapply(pred_files, fread))
+
+prDt <- TFBlearner:::.getPRCurve(all_preds, scores="prob", labels="label", models=c("model", "celltype"), posClass =1, negClass = 0, aggregate=TRUE)
+ggplot(prDt, aes(x=celltype, color=model, y=auc_pr_mod))+geom_point()
+
+# check structure
+head(all_preds)
+
+compute_pr <- function(df) {
+  stopifnot(all(c("prob", "label") %in% names(df)))
+  pr <- pr.curve(scores.class0 = df$prob[df$label == 1],
+                 scores.class1 = df$prob[df$label == 0],
+                 curve = TRUE)
+  data.table(recall = pr$curve[,1],
+             precision = pr$curve[,2],
+             model = unique(df$model),
+             aucpr = pr$auc.integral)
+}
+
+pr_curves <- rbindlist(lapply(split(all_preds, all_preds$model), compute_pr))
+
+ggplot(pr_curves, aes(x = recall, y = precision, color = model)) +
+  geom_line(size = 1.2) +
+  labs(x = "Recall", y = "Precision",
+       title = "PR Curves: Generic vs Tuned",
+       subtitle = sprintf("AUPRC generic=%.3f, tuned=%.3f",
+                          unique(pr_curves[model=="generic"]$aucpr),
+                          unique(pr_curves[model=="tuned"]$aucpr))) +
+  theme_minimal(base_size = 14)
+
+
+```
+
+```{r}
+tuningInstance <- readRDS(file.path(outfile, "tuning_instance_Microglia.rds"))
+arch <- as.data.table(tuningInstance$archive$data)
+head(arch)
+names(arch)
+
+arch[, iter := seq_len(.N)]
+best_row <- arch[which.min(classif.logloss)]
+
+ggplot(arch, aes(x = iter, y = classif.logloss)) +
+  geom_point(color = "black", size = 1) +
+  geom_smooth(se = TRUE, color = "red", fill = "pink", span = 0.3) +
+  geom_point(data = best_row, aes(x = iter, y = classif.logloss),
+             color = "blue", size = 3) +   # highlight best in blue
+  scale_y_log10() +
+  labs(x = "Evaluation", y = "Logloss",
+       title = "Tuning Trajectory") +
+  theme_minimal()
+
+```
+

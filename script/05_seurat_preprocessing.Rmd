@@ -33,14 +33,72 @@ DATA_DIR      <- file.path(PROJECT_ROOT, "data")
 # Load objects you already have
 seo <- readRDS(file.path(DATA_DIR, "seo_annotated_paper.rds"))
 sce <- readRDS(file.path(PROJECT_ROOT, "data", "sce_filtered_proteincoding.rds"))
-consensus_peaks <- readRDS(file.path(DATA_DIR, "consensus_peak_set_chr123.rds"))
-PeakMatrix <- readH5AD(file.path(DATA_DIR, "peak_matrices/PeakMatrix-1-chr123.h5ad"))
+consensus_peaks <- readRDS(file.path(DATA_DIR, "consensus_peak_set.rds"))
+PeakMatrix <- readH5AD(file.path(DATA_DIR, "peak_matrices", "PeakMatrix-1.h5ads"))
 ```
+
+# 3. Subset PeakMatrix
+
+```{r}
+# Create one chr1–3 PeakMatrix file
+consensus_peaks <- readRDS(file.path(DATA_DIR, "consensus_peak_set.rds"))
+GenomeInfoDb::seqlevelsStyle(consensus_peaks) <- "UCSC"
+
+# chr1–3 index 
+chr_idx <- which(as.character(seqnames(consensus_peaks)) %in% c("chr1","chr2","chr3"))
+stopifnot(length(chr_idx) > 0)
+consensus_peaks_chr123 <- consensus_peaks[chr_idx]
+
+# Load full PeakMatrix (rows = peaks)
+peak_mat_path <- file.path(DATA_DIR, "peak_matrices", "PeakMatrix-1.h5ads")
+pm <- zellkonverter::readH5AD(peak_mat_path, use_hdf5 = TRUE)
+
+#Adapt Peakmatrix start to 1-based
+pm_ids <- rownames(pm)
+parts <- tstrsplit(pm_ids, "[:-]")   
+chr   <- parts[[1]]
+start <- as.integer(parts[[2]]) + 1  # convert to 1-based
+end   <- as.integer(parts[[3]])
+
+rownames(pm) <- paste0(chr, "-", start, "-", end)
+
+# Build the expected rowname strings from the *chr1–3 peaks*
+target_ids <- sprintf("%s-%d-%d",
+                      as.character(seqnames(consensus_peaks_chr123)),
+                      start(consensus_peaks_chr123),
+                      end(consensus_peaks_chr123))
+
+# Match those to H5AD rownames
+match_idx <- match(target_ids, rownames(pm))
+if (anyNA(match_idx)) {
+  na_n <- sum(is.na(match_idx))
+  stop("Could not match ", na_n, " chr1–3 consensus peaks to H5AD rows. ",
+       "Check that both files use the same peak definitions/naming.")
+}
+
+pm_chr <- pm[match_idx, ]
+
+assay_name <- intersect(c("X","counts"), names(assays(pm_chr)))[1]
+if (is.na(assay_name)) assay_name <- names(assays(pm_chr))[1]
+
+out_h5ad <- file.path(DATA_DIR, "peak_matrices", "PeakMatrix-1-chr123.h5ad")
+zellkonverter::writeH5AD(pm_chr, file = out_h5ad, X_name = assay_name)
+message("Wrote full subsetted object to: ", out_h5ad,
+        "  (rows=", nrow(pm_chr), ", cols=", ncol(pm_chr), ")")
+
+saveRDS(consensus_peaks_chr123, file.path(DATA_DIR, "consensus_peak_set_chr123.rds"))
+message("Saved matching chr1–3 peaks (n=", length(consensus_peaks_chr123), ").")
+
+```
+
+
 
 # 3. Adapt Peak Matrix to workflow
 ## rowranges
 ```{r}
 # Extract peak names
+PeakMatrix <- pm_chr
+consensus_peaks <- consensus_peaks_chr123
 peak_names <- rownames(PeakMatrix)
 
 chr   <- sub("-.*", "", peak_names)

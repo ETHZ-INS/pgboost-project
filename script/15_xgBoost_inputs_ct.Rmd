@@ -24,7 +24,7 @@ SCRIPT_DIR   <- getwd()
 PROJECT_ROOT <- file.path(SCRIPT_DIR, "..")
 DATA_DIR     <- file.path(PROJECT_ROOT, "data")
 SCORE_DIR   <- file.path(PROJECT_ROOT, "output/feature_scores")
-OUT_DIR <- file.path(PROJECT_ROOT, "output/xgBoost_outputs")
+OUT_DIR <- file.path(PROJECT_ROOT, "output/xgBoost_outputs_2")
 dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
 
 ```
@@ -152,81 +152,128 @@ pseudobulk_logCPM <- function(counts_mat, groups_factor) {
 
 # 5. READ & FILTER BACKBONE
 ```{R}
+# 5. READ & FILTER BACKBONE (celltype-specific)
 message("Reading consensus peaks, TSS, and SNPs ...")
-stop_if_missing(c(consensus_rds, tss_file, snps_bed))
+stop_if_missing(c(consensus_rds, tss_file, snps_bed, seurat_rds))
 
+# Consensus peaks
 consensus_peaks <- readRDS(consensus_rds)
-gr_peaks <- consensus_peaks
-gr_peaks <- keepSeqlevels(gr_peaks, keep_chr, pruning.mode = "coarse")
+gr_peaks_all <- keepSeqlevels(consensus_peaks, keep_chr, pruning.mode = "coarse")
+mcols(gr_peaks_all)$peak <- sprintf("%s-%s-%s",
+                                    as.character(seqnames(gr_peaks_all)),
+                                    start(gr_peaks_all), end(gr_peaks_all))
 
-# add peak ID column 
-mcols(gr_peaks)$peak <- sprintf("%s-%s-%s",
-                                as.character(seqnames(gr_peaks)),
-                                start(gr_peaks),
-                                end(gr_peaks))
+# Peaks table
+peaks_tbl <- data.table(
+  chr   = as.character(seqnames(gr_peaks_all)),
+  start = as.integer(start(gr_peaks_all)),
+  end   = as.integer(end(gr_peaks_all)),
+  peak  = mcols(gr_peaks_all)$peak
+)[, mid := (start + end) %/% 2L]
 
-
-peaks <- data.table(
-  chr   = as.character(seqnames(gr_peaks)),
-  start = as.integer(start(gr_peaks)),
-  end   = as.integer(end(gr_peaks))
-)
-peaks[, peak := sprintf("%s-%s-%s", chr, start, end)]
-
-# TSS 
+# TSS table
 tss <- fread(tss_file)
-if (!all(c("chr","tss","gene") %in% names(tss))) {
-  stop("TSS file must contain columns: chr, tss, gene")
-}
+stopifnot(all(c("chr","tss","gene") %in% names(tss)))
 tss[, chr := paste0("chr", chr)]
 tss <- tss[chr %in% keep_chr]
+tss_tbl <- tss[, .(gene, chr, tss)]
 gr_tss <- GRanges(tss$chr, IRanges(tss$tss, tss$tss), gene = tss$gene)
 
-gr_link <- promoters(gr_tss, upstream = link_kb*1000, downstream = link_kb*1000)
-mcols(gr_link)$gene <- mcols(gr_tss)$gene
-gr_prom <- promoters(gr_tss, upstream = prom_kb*1000, downstream = prom_kb*1000)
-mcols(gr_prom)$gene <- mcols(gr_tss)$gene
-
-message("Computing peak–gene candidates in ±", link_kb, " kb (excluding ±", prom_kb, " kb promoters) ...")
-ov_link <- findOverlaps(gr_peaks, gr_link, ignore.strand = TRUE)
-cand <- unique(data.table(
-  peak = mcols(gr_peaks)$peak[queryHits(ov_link)],
-  gene = mcols(gr_link)$gene [subjectHits(ov_link)]
-))
-
-ov_prom <- findOverlaps(gr_peaks, gr_prom, ignore.strand = TRUE)
-peaks_in_prom <- unique(mcols(gr_peaks)$peak[queryHits(ov_prom)])
-cand <- cand[!peak %in% peaks_in_prom]
-
-# peak–gene distance (midpoint vs TSS), safety filter < link_kb
-peaks_key <- peaks[, .(peak, chr, start, end)][, mid := (start + end) %/% 2L]
-tss_key   <- tss  [, .(gene, chr, tss)]
-setkey(peaks_key, peak)
-setkey(tss_key, gene, chr)
-
-cand <- merge(cand, peaks_key[, .(peak, mid, chr)], by = "peak", all.x = TRUE)
-cand <- merge(cand, tss_key [, .(gene, chr, tss)], by = c("gene","chr"), all.x = TRUE)
-cand[, peak_gene_distance := abs(mid - tss)]
-cand <- cand[peak_gene_distance < link_kb*1000]
-cand[, c("mid","tss","chr") := NULL]
-
-# SNPs (filter to chr1-3)
+# SNP universe (global)
 snps <- fread(snps_bed, col.names = c("chr","start","end"))
 snps[, `:=`(chr = as.character(chr), start = as.integer(start), end = as.integer(end))]
 snps <- snps[chr %in% keep_chr]
 snps[, snp := sprintf("%s-%s-%s", chr, start, end)]
 gr_snps <- GRanges(snps$chr, IRanges(snps$start, snps$end))
 
-message("Expanding peaks to overlapping SNPs ...")
-ov_ps <- findOverlaps(gr_peaks, gr_snps, ignore.strand = TRUE)
-peak_snp <- unique(data.table(
-  peak = mcols(gr_peaks)$peak[queryHits(ov_ps)],
-  snp  = snps$snp            [subjectHits(ov_ps)]
-))
+# Precompute peak->SNP overlaps
+ov_ps_all <- findOverlaps(gr_peaks_all, gr_snps, ignore.strand = TRUE)
+peak_snp_all <- data.table(
+  peak = mcols(gr_peaks_all)$peak[queryHits(ov_ps_all)],
+  snp  = snps$snp                   [subjectHits(ov_ps_all)]
+)
 
-# Backbone: (snp, peak, gene, peak_gene_distance)
-features <- merge(peak_snp, cand, by = "peak", allow.cartesian = TRUE)
-setcolorder(features, c("snp","peak","gene","peak_gene_distance"))
+# Promoter mask
+gr_prom <- promoters(gr_tss, upstream = prom_kb*1000, downstream = prom_kb*1000)
+mcols(gr_prom)$gene <- mcols(gr_tss)$gene
+ov_prom_all <- findOverlaps(gr_peaks_all, gr_prom, ignore.strand = TRUE)
+prom_peaks <- unique(mcols(gr_peaks_all)$peak[queryHits(ov_prom_all)])
+
+# Load Seurat to decide "present" peaks/genes per CT
+seo <- readRDS(seurat_rds)
+stopifnot(celltype_col %in% colnames(seo@meta.data))
+seo <- subset(seo, cells = rownames(seo@meta.data)[seo@meta.data[[celltype_col]] %in% labels])
+seo@meta.data[[celltype_col]] <- factor(seo@meta.data[[celltype_col]], levels = labels)
+
+DefaultAssay(seo) <- "ATAC"
+atac_counts_all <- GetAssayData(seo, assay = "ATAC", slot = "counts")
+rownames(atac_counts_all) <- gsub(":", "-", rownames(atac_counts_all))
+keep_peaks_mask <- grepl(paste0("^(", paste(keep_chr, collapse="|"), ")\\-\\d+\\-\\d+$"), rownames(atac_counts_all))
+atac_counts_all <- atac_counts_all[keep_peaks_mask, , drop = FALSE]
+
+DefaultAssay(seo) <- "RNA"
+rna_counts_all <- GetAssayData(seo, assay = "RNA", slot = "counts")
+
+# Thresholds
+min_peak_frac <- 0.0
+min_gene_frac <- 0.0
+
+# Loop over celltypes
+features_list <- vector("list", length(labels))
+names(features_list) <- labels
+
+for (lab in labels) {
+  message("Building CT-specific candidates for: ", lab)
+  cells_ct <- rownames(seo@meta.data)[seo@meta.data[[celltype_col]] == lab]
+  
+  # Peaks open in this CT
+  atac_ct <- atac_counts_all[, cells_ct, drop = FALSE]
+  keep_peaks_ct <- names(which(Matrix::rowMeans(atac_ct > 0) >= min_peak_frac))
+  keep_peaks_ct <- intersect(keep_peaks_ct, peaks_tbl$peak)
+  
+  # Genes expressed in this CT
+  rna_ct <- rna_counts_all[, cells_ct, drop = FALSE]
+  keep_genes_ct <- rownames(rna_ct)[Matrix::rowMeans(rna_ct > 0) >= min_gene_frac]
+  keep_genes_ct <- intersect(keep_genes_ct, tss_tbl$gene)
+  
+  if (!length(keep_peaks_ct) || !length(keep_genes_ct)) {
+    warning("  No peaks/genes kept for ", lab)
+    next
+  }
+  
+  # Restrict GRanges
+  gr_peaks_ct <- gr_peaks_all[mcols(gr_peaks_all)$peak %in% keep_peaks_ct]
+  gr_tss_ct   <- gr_tss[mcols(gr_tss)$gene %in% keep_genes_ct]
+  
+  # Peak–gene pairs
+  gr_link_ct <- promoters(gr_tss_ct, upstream = link_kb*1000, downstream = link_kb*1000)
+  mcols(gr_link_ct)$gene <- mcols(gr_tss_ct)$gene
+  ov_link_ct <- findOverlaps(gr_peaks_ct, gr_link_ct, ignore.strand = TRUE)
+  cand_ct <- unique(data.table(
+    peak = mcols(gr_peaks_ct)$peak[queryHits(ov_link_ct)],
+    gene = mcols(gr_link_ct)$gene [subjectHits(ov_link_ct)]
+  ))
+  cand_ct <- cand_ct[!peak %in% prom_peaks]
+  
+  # Distances
+  cand_ct <- merge(cand_ct, peaks_tbl[, .(peak, mid, chr)], by = "peak", all.x = TRUE)
+  cand_ct <- merge(cand_ct, tss_tbl, by = c("gene","chr"), all.x = TRUE)
+  cand_ct[, peak_gene_distance := abs(mid - tss)]
+  cand_ct <- cand_ct[peak_gene_distance < link_kb*1000]
+  cand_ct[, c("mid","tss","chr") := NULL]
+  
+  # SNPs
+  peak_snp_ct <- peak_snp_all[peak %in% keep_peaks_ct]
+  
+  # Combine
+  features_ct <- merge(peak_snp_ct, cand_ct, by = "peak", allow.cartesian = TRUE)
+  features_ct[, celltype := lab]
+  
+  features_list[[lab]] <- features_ct
+}
+
+# Combine all CT-specific features
+features <- rbindlist(features_list, use.names = TRUE, fill = TRUE)
 ```
 
 # 6.  Merge Feature scores
@@ -328,16 +375,15 @@ long <- melt(
   variable.factor = FALSE
 )
 
-ylong[, score_cell_raw := score_cell]
+long[, score_cell_raw := score_cell]
 
 # Extract the last token as putative celltype
 long[, celltype := sub("^.*_", "", score_cell_raw)]
 
-# Compute 'score' by stripping ONLY a trailing _<label>
+# Compute 'score' 
 ct_tail_pat <- paste0("_(?:", paste(labels, collapse="|"), ")$")
 long[, score := sub(ct_tail_pat, "", score_cell_raw, perl = TRUE)]
 
-# Drop anything whose tail isn't a real celltype (fixes 'g-exp-beta', 'g', 'n', etc.)
 bad <- long[!celltype %chin% labels, unique(score_cell_raw)]
 if (length(bad)) {
   warning("Dropping columns without a valid celltype suffix: ",
