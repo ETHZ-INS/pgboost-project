@@ -1,0 +1,19 @@
+---
+title: "X_xgboost_mousedata"
+author: "tobiasmohl"
+date: "2025-10-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+SCRIPT_DIR   <- getwd()
+PROJECT_ROOT <- file.path(SCRIPT_DIR, "..")
+DATA_DIR     <- file.path(PROJECT_ROOT, "data_mouse")
+```
+
+```{r}
+seo_small <- readRDS(file.path(DATA_DIR, "seo_small.rds"))
+```
+

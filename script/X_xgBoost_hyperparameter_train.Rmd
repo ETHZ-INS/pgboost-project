@@ -34,7 +34,7 @@ TUNING_DIR <- file.path(XGB_DIR, "tuning")
 PRED_DIR   <- file.path(XGB_DIR, "predictions")
 MODEL_DIR  <- file.path(XGB_DIR, "models")
 
-run_name <- "xgBoost_tuning_500evals_reducedParams"
+run_name <- "xgBoost_tuning_500evals_allParams"
 
 data_file      <- file.path(XGB_DIR, "data_aggregated.tsv")
 training_file  <- file.path(PROJECT_ROOT, "data", "eqtl_files", "training_data_snppg_aggregated_new.tsv.gz")
@@ -346,7 +346,7 @@ ggplot(pr_curves, aes(x = recall, y = precision, color = model)) +
 ```
 
 ```{r}
-tuningInstance <- readRDS(file.path(outfile, "tuning_instance_Microglia.rds"))
+tuningInstance <- readRDS(file.path(outfile, "tuning_instance_Neurons.rds"))
 arch <- as.data.table(tuningInstance$archive$data)
 head(arch)
 names(arch)
@@ -363,6 +363,92 @@ ggplot(arch, aes(x = iter, y = classif.logloss)) +
   labs(x = "Evaluation", y = "Logloss",
        title = "Tuning Trajectory") +
   theme_minimal()
+
+```
+```{r}
+tuningInstances <- list.files(outfile, full.names = TRUE, pattern = "tuning_instance_.*\\.rds$")
+archives <- lapply(tuningInstances, function(f) {
+  inst <- readRDS(f)
+  arch <- as.data.table(inst$archive$data)
+  arch[, iter := seq_len(.N)]
+  arch[, celltype := sub("tuning_instance_(.*)\\.rds", "\\1", basename(f))]
+  
+  # mark best row
+  best_iter <- arch[which.min(classif.logloss), iter]
+  arch[, best_iter := best_iter]
+  return(arch)
+})
+
+all_arch <- rbindlist(archives)
+
+# Plot
+ggplot(all_arch, aes(x = iter, y = classif.logloss, color = celltype)) +
+  geom_smooth(se = FALSE, size = 1.2, span = 0.3) +  # smooth curve per CT
+  geom_vline(aes(xintercept = best_iter, color = celltype),
+             data = unique(all_arch[, .(celltype, best_iter)]),
+             linetype = "dashed", size = 0.8) +      # vertical line at min
+  scale_y_log10() +
+  labs(x = "Iteration", y = "Logloss (log scale)",
+       title = "Tuning trajectories across cell types",
+       subtitle = "Smoothed curves; dashed line = iteration of minimum logloss") +
+  theme_minimal(base_size = 14)
+```
+
+```{r fig.width=10, fig.height=8}
+tuningInstances <- list.files(outfile, full.names = TRUE, pattern = "tuning_instance_.*\\.rds$")
+
+archives <- lapply(tuningInstances, function(f) {
+  inst <- readRDS(f)
+  arch <- as.data.table(inst$archive$best())
+  arch[, celltype := sub("tuning_instance_(.*)\\.rds", "\\1", basename(f))]
+  return(arch)
+})
+
+all_archives <- rbindlist(archives)
+all_archives
+
+
+plot_dt <- melt(
+  all_archives,
+  id.vars = "celltype",
+  #measure.vars = c("eta","max_depth","lambda","alpha"),
+  measure.vars = c("eta","max_depth","lambda","alpha", "min_child_weight", "subsample", "colsample_bytree", "gamma"),
+  variable.name = "parameter",
+  value.name = "value"
+)
+
+ggplot(plot_dt, aes(x = celltype, y = value, color = parameter)) +
+  geom_point(size = 3, position = position_dodge(width = 0.5)) +
+  facet_wrap(~parameter, scales = "free_y") +
+  labs(x = "Cell type", y = "Parameter value",
+       title = "Best tuned XGBoost parameters per cell type") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+```{r fig.width=10, fig.height=6}
+ggplot(all_arch, aes(x = max_depth, y = classif.logloss, color = celltype)) +
+  geom_point(alpha = 0.5) +
+  scale_y_log10() +
+  facet_wrap(~celltype) +
+  theme_minimal()
+
+ggplot(all_arch, aes(x = eta, y = max_depth, color = classif.logloss)) +
+  geom_point() +
+  scale_color_viridis_c(option="plasma", trans="log") +
+  facet_wrap(~celltype) +
+  labs(title="Parameter trade-offs", subtitle="Color = logloss") +
+  theme_minimal()
+
+best_params <- all_arch[, .SD[which.min(classif.logloss)], by=celltype]
+best_long <- melt(best_params, id.vars="celltype",
+                  #measure.vars=c("eta","max_depth","lambda","alpha")
+                  measure.vars = c("eta","max_depth","lambda","alpha", "min_child_weight", "subsample", "colsample_bytree")
+)
+
+ggplot(best_long, aes(x=variable, y=value, fill=celltype)) +
+  geom_bar(stat="identity", position="dodge") +
+  theme_minimal()
+
 
 ```
 

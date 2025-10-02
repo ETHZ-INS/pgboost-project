@@ -33,10 +33,10 @@ TUNING_DIR <- file.path(XGB_DIR, "tuning")
 
 dir.create(TUNING_DIR,  recursive = TRUE, showWarnings = FALSE)
 
-run_name <- "xgBoost_tuning_5"
+run_name <- "xgBoost_tuning_6"
 
 data_file      <- file.path(XGB_DIR, "data_aggregated.tsv")
-training_file  <- file.path(PROJECT_ROOT, "data", "eqtl_files", "training_data_snppg_aggregated_new.tsv.gz")
+training_file  <- file.path(PROJECT_ROOT, "data", "eqtl_files", "training_data_snppg_aggregated.tsv.gz")
 outfile  <- file.path(TUNING_DIR, run_name)
 dir.create(outfile,  recursive = TRUE, showWarnings = FALSE)
 
@@ -146,7 +146,7 @@ task <- TaskClassif$new(
 annoCol <- "chr"
 task$set_col_roles(annoCol, add_to = "group", remove_from = "feature")
 
-pred_cols <- setdiff(names(trainTable), c(index_cols, "label", "chr", "gene_id")) # TODO remove Fixed_p and run with old data
+pred_cols <- setdiff(names(trainTable), c(index_cols, "label", "chr", "gene_id", "Fixed_P")) # TODO remove Fixed_p and run with old data
 task$select(pred_cols)   # keep only feature columns as features
 
 rs <- mlr3::rsmp("loo")
@@ -197,6 +197,7 @@ hp <- as.data.table(lgbmInst$result)
 saveRDS(lgbmInst$result, file = file.path(outfile, "best_result.rds"))
 
 ```
+
 ```{r}
 tuningInstance <- readRDS(file.path(outfile, "tuning_instance.rds"))
 arch <- as.data.table(tuningInstance$archive$data)
@@ -211,8 +212,6 @@ ggplot(arch, aes(x = iter, y = classif.logloss)) +
   geom_smooth(se = TRUE, color = "red", fill = "pink", span = 0.3) +
   geom_point(data = best_row, aes(x = iter, y = classif.logloss),
              color = "blue", size = 3) +   # highlight best in blue
-   geom_point(data = subset(arch, iter==18), aes(x = iter, y = gamma),
-             color = "red", size = 3) +
   scale_y_log10() +
   labs(x = "Evaluation", y = "Logloss",
        title = "Tuning Trajectory") +

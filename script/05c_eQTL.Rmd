@@ -109,7 +109,6 @@ rna <- GetAssayData(seo, "RNA", "counts")
 min_peak_frac <- 0.0 
 min_gene_frac <- 0.0  
 
-ct_code <- "astrocytes"
 
 make_ct_labels <- function(ct_code, ct_file_codes) {
   message("CT: ", ct_code)
@@ -130,42 +129,28 @@ make_ct_labels <- function(ct_code, ct_file_codes) {
                                  keytype="SYMBOL", columns="GENEID")
     map <- unique(map[!is.na(map$GENEID), ])
     gene_present_ensg <- unique(map$GENEID)
-  } else {
-    gene_present_ensg <- unique(gene_present)
-  }
+  } else gene_present_ensg <- unique(gene_present)
   gr_tss_ct <- gr_tss[mcols(gr_tss)$gene_id %in% gene_present_ensg]
-
-  if (length(peaks_ct) == 0L || length(gr_tss_ct) == 0L) {
-    message("  No peaks/genes after presence thresholds for ", ct_code)
-    return(NULL)
-  }
+  if (length(peaks_ct) == 0L || length(gr_tss_ct) == 0L) { message("  No peaks/genes for ", ct_code); return(NULL) }
 
   ## TSS-centered candidates minus promoter peaks
   gr_link_ct <- promoters(gr_tss_ct, upstream=link_kb*1000, downstream=link_kb*1000)
   mcols(gr_link_ct)$gene_id <- mcols(gr_tss_ct)$gene_id
   ov_ct <- findOverlaps(peaks_ct, gr_link_ct, ignore.strand=TRUE)
-
   cand <- unique(data.table(
-    peak    = mcols(peaks_ct)$peak[queryHits(ov_ct)], # "chr-start-end"
+    peak    = mcols(peaks_ct)$peak[queryHits(ov_ct)],
     gene_id = mcols(gr_link_ct)$gene_id[subjectHits(ov_ct)]
   ))
   cand <- cand[ !peak %in% prom_peaks ]
-
-  # add chr + mid from peak_tbl
+  # add chr/tss/mid + distance filter
   cand <- merge(cand, peak_tbl[, .(peak, chr, mid)], by="peak", all.x=TRUE)
-
-  # add tss per gene
   tss_dt <- as.data.table(gr_tss_ct)[, .(gene_id, chr_tss=as.character(seqnames), tss=start)]
   cand   <- merge(cand, tss_dt, by="gene_id", all.x=TRUE)
-
-  # distance by peak midpoint vs TSS < link_kb
   cand[, peak_gene_distance := abs(mid - tss)]
-  cand <- cand[ peak_gene_distance < link_kb*1000 ]
-  cand[, c("mid","tss") := NULL ]
-
+  cand <- cand[ peak_gene_distance < link_kb*1000 ][, c("mid","tss") := NULL ]
   if (!nrow(cand)) { message("  No (peak,gene) candidates for ", ct_code); return(NULL) }
 
-  ## read eQTL only for this CT
+  ## read eQTL for this CT (possibly multiple sources, e.g. Ext+IN)
   read_one <- function(code) {
     p <- file.path(EQTL_DIR, paste0(code, "_eqtl_full_assoc.tsv.gz"))
     if (!file.exists(p)) { message("  Missing eQTL file: ", basename(p)); return(NULL) }
@@ -174,11 +159,16 @@ make_ct_labels <- function(ct_code, ct_file_codes) {
   eqtl_list <- lapply(ct_file_codes, read_one)
   eqtl_list <- Filter(Negate(is.null), eqtl_list)
   if (!length(eqtl_list)) return(NULL)
+
   eqtl <- rbindlist(eqtl_list, use.names=TRUE, fill=TRUE)
   eqtl[, gene_id := sub("\\..*", "", feature)]
   if (!all(grepl("^chr", eqtl$chr))) eqtl[, chr := paste0("chr", chr)]
 
-  # label rule
+  ## If same (variant,gene) appears multiple times (Ext vs IN), keep min p
+  setorder(eqtl, variant_id, gene_id, Fixed_P)
+  eqtl <- eqtl[, .SD[1L], by = .(variant_id, gene_id)]
+
+  ## label rule on collapsed eQTLs
   pos_cutoff <- 1e-6; strong_cut <- 1e-2; neg_cutoff <- 0.4
   strong <- eqtl[Fixed_P < strong_cut]
   eqtl[, label := fifelse(Fixed_P < pos_cutoff, 1L,
@@ -186,9 +176,9 @@ make_ct_labels <- function(ct_code, ct_file_codes) {
                            variant_id %in% strong$variant_id &
                            gene_id   %in% strong$gene_id, 2L, 3L))]
 
-  ## SNP → CT peaks only
-  snp_gr   <- GRanges(seqnames=eqtl$chr, ranges=IRanges(eqtl$pos, width=1))
-  hits_ct  <- findOverlaps(snp_gr, peaks_ct, ignore.strand=TRUE)
+  ## SNP ↔ peaks of this CT
+  snp_gr  <- GRanges(seqnames=eqtl$chr, ranges=IRanges(eqtl$pos, width=1))
+  hits_ct <- findOverlaps(snp_gr, peaks_ct, ignore.strand=TRUE)
   if (!length(hits_ct)) { message("  No SNP↔peak overlaps for ", ct_code); return(NULL) }
 
   peak_str_ct <- sprintf("%s-%d-%d",
@@ -206,45 +196,52 @@ make_ct_labels <- function(ct_code, ct_file_codes) {
     peak       = peak_str_ct
   )
 
-  # keep only CT (peak,gene) candidates
-  setkey(snppg, peak, gene_id)
-  setkey(cand,   peak, gene_id)
+  ## keep only CT (peak,gene) candidates (chr join is redundant but ok)
+  setkey(snppg, peak, gene_id, chr)
+  setkey(cand,  peak, gene_id, chr)
   snppg <- snppg[cand, nomatch=0]
-
   if (!nrow(snppg)) { message("  No SNP–peak–gene after CT filtering for ", ct_code); return(NULL) }
 
   snppg[, snp := sprintf("%s-%d-%d", chr, as.integer(pos)-1L, as.integer(pos))]
   snppg[, celltype := ct_code]
 
-  # Ensembl → symbol
-  sym <- AnnotationDbi::select(ensdb, keys=unique(snppg$gene_id),
+  ## aggregate: one SNP with lowest p per (peak,gene_id,celltype)
+  setorder(snppg, Fixed_P)
+  snppg_agg <- snppg[, .SD[1L], by = .(peak, gene_id, celltype)]
+
+  ## map SYMBOL **after** aggregation
+  sym <- AnnotationDbi::select(ensdb, keys=unique(snppg_agg$gene_id),
                                keytype="GENEID", columns="SYMBOL")
   sym <- unique(data.table(gene_id=sym$GENEID, gene=sym$SYMBOL))
-  setkey(sym, gene_id); setkey(snppg, gene_id)
-  snppg <- sym[snppg]
-  snppg[is.na(gene) | gene=="", gene := gene_id]
+  setkey(sym, gene_id); setkey(snppg_agg, gene_id)
+  snppg_agg <- sym[snppg_agg]
+  snppg_agg[is.na(gene) | gene=="", gene := gene_id]
 
-  # aggregation
-  # choose the SNP with the lowest Fixed_P per (peak, gene, celltype)
-  snppg <- snppg[order(Fixed_P)]
-  snppg <- snppg[, .SD[1L], by = .(peak, gene, celltype)]
-
-  # final columns
-  snppg <- snppg[, .(peak, gene, celltype, label, Fixed_P)]
+  ## final return
+  snppg_agg[, .(peak, gene_id, gene, celltype, label, Fixed_P)]
 }
 
 
 ct_map <- data.table(
-  ct_code   = c("astrocytes","endothelial","Microglia","Oligodendrocytes","OPC","Neurons","Neurons"),
-  eqtl_name = c("Ast","End","MG","OD","OPC","Ext","IN")
+  ct_code   = c("Neurons","astrocytes","endothelial","Microglia","Oligodendrocytes","OPC"),
+  eqtl_name = I(list(c("Ext","IN"), "Ast","End","MG","OD","OPC"))
 )
 
 all_lab <- rbindlist(lapply(seq_len(nrow(ct_map)), function(i)
-  make_ct_labels(ct_map$ct_code[i], ct_map$eqtl_name[i])),
+  make_ct_labels(ct_map$ct_code[i], ct_map$eqtl_name[[i]])),
   use.names = TRUE, fill = TRUE)
-fwrite(all_lab, file.path(EQTL_DIR, "training_data_snppg_aggregated.tsv.gz"), sep="\t")
 
+# Sanity checks
+dup_summary <- all_lab[, .N, by=.(peak, gene_id, celltype)][N > 1]
+cat("Remaining duplicated (peak,gene_id,celltype): ", nrow(dup_summary), "\n")
 
+# Save
+out_path <- file.path(EQTL_DIR, "training_data_snppg_aggregated_new.tsv.gz")
+fwrite(all_lab[, .(peak, gene_id, gene, celltype, label, Fixed_P)], out_path, sep="\t")
+cat("Wrote: ", out_path, " (", nrow(all_lab), " rows)\n", sep="")
+
+# Optional: assert file exists
+stopifnot(file.exists(out_path))
 ```
 
 
