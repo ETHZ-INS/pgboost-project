@@ -36,13 +36,13 @@ consensus_rds <- file.path(DATA_DIR, "consensus_peak_set.rds")
 consensus_bed <- file.path(DATA_DIR, "consensus_peaks.bed")
 
 tss_file      <- file.path(DATA_DIR, "TSS.txt.gz")
-snps_bed      <- file.path(DATA_DIR, "SNPs.bed.gz")
+#snps_bed      <- file.path(DATA_DIR, "SNPs.bed.gz")
 celltypes_tsv <- file.path(DATA_DIR, "celltypes.tsv")
 celltype_col  <- "cell_type_manual"
 keep_chr <- c("chr1","chr2","chr3")
 
 # Output directory and filenames
-data_tsv_path <- file.path(OUT_DIR, "data.tsv")
+data_tsv_path <- file.path(OUT_DIR, "data_noSNP.tsv")
 predictors_path <- file.path(OUT_DIR, "predictors.txt")
 dropdups_path <- file.path(OUT_DIR, "drop_duplicates.txt")
 
@@ -153,7 +153,7 @@ pseudobulk_logCPM <- function(counts_mat, groups_factor) {
 # 5. READ & FILTER BACKBONE
 ```{R}
 message("Reading consensus peaks, TSS, and SNPs ...")
-stop_if_missing(c(consensus_rds, tss_file, snps_bed))
+stop_if_missing(c(consensus_rds, tss_file))
 
 consensus_peaks <- readRDS(consensus_rds)
 gr_peaks <- consensus_peaks
@@ -211,22 +211,33 @@ cand <- cand[peak_gene_distance < link_kb*1000]
 cand[, c("mid","tss","chr") := NULL]
 
 # SNPs (filter to chr1-3)
-snps <- fread(snps_bed, col.names = c("chr","start","end"))
-snps[, `:=`(chr = as.character(chr), start = as.integer(start), end = as.integer(end))]
-snps <- snps[chr %in% keep_chr]
-snps[, snp := sprintf("%s-%s-%s", chr, start, end)]
-gr_snps <- GRanges(snps$chr, IRanges(snps$start, snps$end))
+#snps <- fread(snps_bed, col.names = c("chr","start","end"))
+#snps[, `:=`(chr = as.character(chr), start = as.integer(start), end = as.integer(end))]
+#snps <- snps[chr %in% keep_chr]
+#snps[, snp := sprintf("%s-%s-%s", chr, start, end)]
+#gr_snps <- GRanges(snps$chr, IRanges(snps$start, snps$end))
 
-message("Expanding peaks to overlapping SNPs ...")
-ov_ps <- findOverlaps(gr_peaks, gr_snps, ignore.strand = TRUE)
-peak_snp <- unique(data.table(
-  peak = mcols(gr_peaks)$peak[queryHits(ov_ps)],
-  snp  = snps$snp            [subjectHits(ov_ps)]
-))
+#message("Expanding peaks to overlapping SNPs ...")
+#ov_ps <- findOverlaps(gr_peaks, gr_snps, ignore.strand = TRUE)
+#peak_snp <- unique(data.table(
+  #peak = mcols(gr_peaks)$peak[queryHits(ov_ps)],
+  #snp  = snps$snp            [subjectHits(ov_ps)]
+#))
 
-# Backbone: (snp, peak, gene, peak_gene_distance)
-features <- merge(peak_snp, cand, by = "peak", allow.cartesian = TRUE)
-setcolorder(features, c("snp","peak","gene","peak_gene_distance"))
+features <- cand
+setcolorder(features, c("peak", "gene", "peak_gene_distance"))
+
+# Add chromosome information (for completeness)
+features <- merge_left(features, peaks[, .(peak, chr)], by = "peak")
+
+# For each gene, find the closest peak to its TSS (based on midpoint distance)
+setorder(features, gene, peak_gene_distance)
+closest <- features[, .SD[1L], by = gene][, .(peak, gene)]
+closest[, closest_tss := 1L]
+
+# Merge closest-flag back
+features <- merge_left(features, closest, by = c("peak", "gene"))
+features[is.na(closest_tss), closest_tss := 0L]
 ```
 
 # 6.  Merge Feature scores
@@ -297,28 +308,15 @@ for (i in seq_along(labels)) {
     }
   }
 }
-# snp->chr and distances to TSS (closest flag)
-snps_mid <- snps[, .(snp, chr, mid = start)]
-features <- merge_left(features, snps_mid, by = "snp")
-features <- merge_left(features, tss[, .(gene, chr, tss)], by = c("gene","chr"))
-features[, snp_gene_distance := abs(mid - tss)]
-features[, c("mid","tss") := NULL]
 
-setorder(features, snp, snp_gene_distance)
-closest <- features[, .SD[1L], by = snp][, .(snp, gene)]
-closest[, closest_tss := 1L]
-features <- merge_left(features, closest, by = c("snp","gene"))
-features[is.na(closest_tss), closest_tss := 0L]
-features[, chr := tstrsplit(snp, "-", fixed = TRUE, keep = 1L)]
 
 ```
-
 # 7. Reshape to Wide
 ```{r}
 score_suffixes <- paste0("_(", paste(labels, collapse="|"), ")$")
 score_cols_all <- grep(score_suffixes, names(features), value = TRUE)
 
-id_cols <- c("snp","gene","peak","snp_gene_distance","peak_gene_distance","closest_tss","chr")
+id_cols <- c("gene","peak", "peak_gene_distance","closest_tss","chr")
 long <- melt(
   features,
   id.vars      = intersect(id_cols, names(features)),
@@ -328,7 +326,7 @@ long <- melt(
   variable.factor = FALSE
 )
 
-ylong[, score_cell_raw := score_cell]
+long[, score_cell_raw := score_cell]
 
 # Extract the last token as putative celltype
 long[, celltype := sub("^.*_", "", score_cell_raw)]
@@ -352,18 +350,19 @@ long[, c("score_cell","score_cell_raw") := NULL]
 # Cast to wide: one row per (snp, gene, peak, celltype, ...) and one column per 'score'
 flat <- dcast(
   long,
-  snp + gene + peak + celltype + snp_gene_distance + peak_gene_distance + closest_tss + chr ~ score,
+  gene + peak + celltype + peak_gene_distance + closest_tss + chr ~ score,
   value.var = "value",
   fun.aggregate = agg_fun
 )
 
 # Base columns first
-base_cols <- c("snp","gene","peak","celltype","snp_gene_distance","peak_gene_distance","closest_tss","chr")
+base_cols <- c("gene","peak","celltype","peak_gene_distance","closest_tss","chr")
 score_cols <- setdiff(names(flat), base_cols)
 setcolorder(flat, c(base_cols, score_cols))
 stopifnot(length(score_cols) > 0L)
 stopifnot(all(flat$celltype %chin% labels))
 ```
+
 
 # 8. add logCPM features
 ```{r}
@@ -447,7 +446,8 @@ message("Wrote: ", data_tsv_path)
 # Update predictors list
 score_cols <- setdiff(names(flat), base_cols)
 new_pred_names <- c("gene_logCPM", "peak_logCPM")
-preds <- c("snp_gene_distance","peak_gene_distance","closest_tss", score_cols)
+preds <- c("peak_gene_distance","closest_tss", score_cols)
+message("Writing new data_noSNP.tsv ...")
 writeLines(unique(c(preds, new_pred_names)), predictors_path)
 writeLines("peak", dropdups_path)
 message("Updated: ", predictors_path, " and ", dropdups_path)

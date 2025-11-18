@@ -72,7 +72,8 @@ for (key in keys) {
   peak_stats <- data.frame(
     peak_id   = rownames(B),
     mean_atac = as.numeric(p),
-    var_atac  = as.numeric(p * (1 - p)),
+    #var_atac  = as.numeric(p * (1 - p)), # this should be changed to
+    var_atac  = Seurat:::RowVarSparse(B),
     stringsAsFactors = FALSE
   )
   

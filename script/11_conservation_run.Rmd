@@ -53,17 +53,11 @@ phast <- phastCons100way.UCSC.hg38
 seqlevelsStyle(peaks_gr) <- seqlevelsStyle(phast)
 peaks_gr <- trim(peaks_gr)
 
-# Stable peak identifier: "chr-start-end"
 peaks_gr$peak_id <- paste0(seqnames(peaks_gr), "-", start(peaks_gr), "-", end(peaks_gr))
 
 cons_full <- gscores(phast, peaks_gr, scores.only = TRUE)
 
-# Robust extraction (DataFrame vs numeric vector)
-cons_vec <- if (is(cons_full, "DataFrame")) {
-  as.numeric(cons_full[["default"]])
-} else {
-  as.numeric(cons_full)
-}
+cons_vec <- as.numeric(cons_full[["default"]])
 
 cons_df <- data.frame(
   peak  = peaks_gr$peak_id,

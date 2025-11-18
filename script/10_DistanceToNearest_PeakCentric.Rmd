@@ -38,15 +38,16 @@ celltype_col   <- "cell_type_manual"
 
 # 3. Helpers
 ```{r}
-# Compute distance-to-nearest rank score 
 score_candidates_dt <- function(dt) {
   stopifnot(all(c("peak_id","gene_id","peak_start","peak_end","tss") %in% names(dt)))
-  # peak center (integer, ~ floor((start+end)/2))
   dt[, peak_center := as.integer((peak_start + peak_end) %/% 2)]
+  
   # absolute distance to TSS
   dt[, distance := abs(peak_center - tss)]
+  
   # nearest distance per peak
   dt[, nearest_dist := min(distance), by = peak_id]
+  
   # gap >= 0
   dt[, gap := pmax(distance - nearest_dist, 0L)]
   # rank by gap within each peak (nearest=rank 1)
@@ -99,7 +100,7 @@ for (key in keys) {
   outfile_prefix <- file.path(OUT_SCORE_DIR, paste0("distanceToNearest_", safe_key))
   status_file    <- file.path(OUT_SCORE_DIR, paste0("distanceToNearest_", safe_key, ".status.tsv"))
 
-  # 1) locate candidates file (use file.exists, not is.na)
+  # locate candidates file 
   cand_file <- file.path(CAND_DIR, paste0("candidates_", safe_key, ".tsv"))
   if (!file.exists(cand_file)) {
     warning("No candidates file found for '", key, "': ", cand_file)
@@ -112,15 +113,15 @@ for (key in keys) {
   message("  Candidates: ", cand_file)
   dt <- data.table::fread(cand_file)
 
-  # 2) required columns
+  # required columns
   need <- c("cell_type","peak_id","gene_id","peak_chr","peak_start","peak_end","gene_chr","tss")
   miss <- setdiff(need, names(dt))
   if (length(miss)) stop("Missing required columns in ", cand_file, ": ", paste(miss, collapse = ", "))
 
-  # 3) keep only this cell type (case-insensitive)
+  # keep only this cell type (case-insensitive)
   dt <- dt[tolower(cell_type) == tolower(key)]
 
-  # 4) ensure integer coords + drop rows with missing coords  <<< ADD HERE
+  # ensure integer coords + drop rows with missing coords  <<< ADD HERE
   num_cols <- c("peak_start","peak_end","tss")
   dt[, (num_cols) := lapply(.SD, as.integer), .SDcols = num_cols]
   dt <- dt[!is.na(peak_start) & !is.na(peak_end) & !is.na(tss)]
@@ -132,7 +133,6 @@ for (key in keys) {
     next
   }
 
-  # 5) Optional Seurat-based filtering
   if (use_filters) {
     sel <- as.vector(obj_all[[celltype_col]][, 1]) == key
     n_sel <- sum(sel, na.rm = TRUE)
@@ -168,10 +168,10 @@ for (key in keys) {
     }
   }
 
-  # 6) score by distance-to-nearest (within-peak rank)
+  # score by distance-to-nearest (within-peak rank)
   dt_scored <- score_candidates_dt(dt)
 
-  # 7) finalize and write
+  # finalize and write
   out3 <- finalize_three_cols(dt_scored)
   write_outputs_three(out3, outfile_prefix)
 

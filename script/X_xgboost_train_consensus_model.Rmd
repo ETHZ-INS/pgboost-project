@@ -1,0 +1,210 @@
+---
+title: "X_xgboost_train_consensus_model"
+author: "tobiasmohl"
+date: "2025-10-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(GenomicRanges)
+  library(xgboost)
+  library(PRROC)
+})
+
+set.seed(187)
+
+SCRIPT_DIR   <- getwd()
+PROJECT_ROOT <- file.path(SCRIPT_DIR, "..")
+
+DATA_DIR   <- file.path(PROJECT_ROOT, "data")
+XGB_DIR    <- file.path(PROJECT_ROOT, "output/xgBoost_outputs")
+
+MODEL_DIR  <- file.path(XGB_DIR, "models", "consensus_models")
+PRED_DIR   <- file.path(XGB_DIR, "predictions", "xgb_consensus_all_features")
+
+dir.create(MODEL_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(PRED_DIR,  recursive = TRUE, showWarnings = FALSE)
+
+data_file      <- file.path(XGB_DIR, "data_noSNP.tsv")
+training_file  <- file.path(PROJECT_ROOT, "data", "eqtl_files",
+                            "training_data_snppg_aggregated_new.tsv.gz")
+predictor_file <- file.path(XGB_DIR, "predictors.txt")
+
+```
+
+```{r}
+full_data     <- fread(data_file)
+training_data <- fread(training_file)
+
+# --- map cell types ---
+
+ct_map <- c(
+Ast = "astrocytes",
+MG  = "Microglia",
+OD  = "Oligodendrocytes",
+OPC = "OPC",
+IN  = "Neurons",
+Ext = "Neurons",
+End = "Endothelial"
+)
+
+remap_ct <- function(x) ifelse(x %in% names(ct_map), ct_map[x], x)
+
+training_data[, celltype := remap_ct(celltype)]
+full_data[,     celltype := remap_ct(celltype)]
+
+# --- merge by full identity ---
+
+training_data[, chr := tstrsplit(peak, "-", keep = 1L)]
+
+index_cols <- c("peak", "gene", "celltype", "chr")
+
+setkeyv(full_data, index_cols)
+setkeyv(training_data, index_cols)
+
+data <- full_data[training_data, nomatch = 0L]
+
+# --- labels ---
+
+data[label == 2L, label := 0L]
+data <- data[label %in% c(0L, 1L)]
+
+```
+
+```{r}
+# --- features ---
+predictors <- scan(predictor_file, what = character(), quiet = TRUE)
+feature_cols <- intersect(predictors, names(data))
+
+exclude_features <- c("predEnhancer_g_exp_score", "predEnhancer_g_lin_beta", "predEnhancer_g_lin_score", "predEnhancer_p_exp_beta", "predEnhancer_p_exp_score", "predEnhancer_p_lin_beta", "predEnhancer_p_lin_score", "predEnhancer_g_exp_beta")
+feature_cols <- setdiff(feature_cols, exclude_features)
+
+#exclude_features <- c("tad_n_boundaries", "tad_pyt_score", "tad_sum_score")
+exclude_features <- c("gene_logCPM", "conservation")
+feature_cols <- setdiff(feature_cols, exclude_features)
+
+feature_cols <- c("peak_gene_distance", "closest_tss","scent", "signac", "cicero" )
+
+message("Merged data with ", nrow(data), " rows and ", length(feature_cols), " features.")
+```
+
+
+```{r}
+tuning_dir <- file.path(PROJECT_ROOT, "output/xgBoost_outputs/tuning/xgBoost_tuning_500evals_allParams")
+
+files <- list.files(tuning_dir, pattern = "^tuning_instance_.*\\.rds$", full.names = TRUE)
+
+archives <- lapply(files, function(f) {
+inst <- readRDS(f)
+best <- as.data.table(inst$archive$best())
+best[, celltype := sub("tuning_instance_(.*)\\.rds", "\\1", basename(f))]
+return(best)
+})
+
+all_params <- rbindlist(archives, fill = TRUE)
+
+avg_params <- all_params[, lapply(.SD, mean),
+.SDcols = setdiff(names(all_params), "celltype")]
+
+consensus_params <- list(
+booster          = "gbtree",
+objective        = "binary",
+eval_metric      = "aucpr",
+eta              = avg_params$eta,
+max_depth        = round(avg_params$max_depth),
+lambda           = avg_params$lambda,
+alpha            = avg_params$alpha,
+min_child_weight = avg_params$min_child_weight,
+subsample        = avg_params$subsample,
+colsample_bytree = avg_params$colsample_bytree,
+gamma            = avg_params$gamma
+)
+
+```
+```{r}
+consensus_params <- list(
+  booster           = "gbtree",
+  objective         = "binary:logistic",
+  eval_metric       = "aucpr",
+  eta               = 0.05,
+  max_depth         = 6,
+  gamma             = 10,
+  min_child_weight  = 6,
+  subsample         = 0.8,
+  colsample_bytree  = 1,
+  lambda            = 0,
+  alpha             = 0
+)
+```
+
+```{r}
+train_xgb <- function(X, y, params, folds, max_nrounds = 500) {
+  params$objective   <- "binary:logistic"
+  params$eval_metric <- "aucpr"
+  
+  # remove keys that xgboost might misinterpret
+  params <- params[!(names(params) %in% c("nrounds", "nthread"))]
+  
+  dtrain <- xgb.DMatrix(as.matrix(X), label = y)
+  
+  cv <- xgb.cv(
+    data = dtrain,
+    params = params,
+    nrounds = max_nrounds,
+    folds = folds,
+    nthread = 8,
+    early_stopping_rounds = 10,
+    verbose = 1
+  )
+  
+  best_nrounds <- cv$best_iteration
+  message("Training with ", best_nrounds, " boosting rounds.")
+  
+  bst <- xgb.train(
+    params  = params,
+    data    = dtrain,
+    nrounds = best_nrounds,
+    nthread = 8,
+    verbose = 1
+  )
+  
+  list(model = bst, best_nrounds = best_nrounds)
+}
+
+predict_and_score <- function(model_obj, X_test, y_test) {
+  bst <- if (is.list(model_obj)) model_obj$model else model_obj
+  
+  p_hat <- predict(bst, as.matrix(X_test))
+  
+  logloss <- -mean(y_test * log(p_hat + 1e-15) + (1 - y_test) * log(1 - p_hat + 1e-15))
+  
+  pr <- PRROC::pr.curve(scores.class0 = p_hat[y_test == 1],
+                        scores.class1 = p_hat[y_test == 0],
+                        curve = FALSE)
+  
+  list(
+    preds = data.table(prob = p_hat, label = y_test),
+    metrics = list(logloss = logloss, auprc = pr$auc.integral)
+  )
+}
+
+```
+
+```{r}
+folds <- split(seq_len(nrow(data)), data$chr)
+
+consensus_model <- train_xgb(
+  X = data[, ..feature_cols],
+  y = data$label,
+  params = consensus_params,
+  folds = folds,
+  max_nrounds = 500
+)
+
+xgb.save(consensus_model$model,
+         file.path(MODEL_DIR, "xgb_consensus_pgBoost.model"))
+```

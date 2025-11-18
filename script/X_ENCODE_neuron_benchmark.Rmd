@@ -1,0 +1,353 @@
+---
+title: "test"
+author: "tobiasmohl"
+date: "2025-11-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(data.table)
+library(GenomicRanges)
+library(PRROC)
+library(ggplot2)
+library(ROCR)
+
+
+```
+
+```{r}
+pred_neurons_allParams_tuned <- fread("/mnt/germain/work/tomohl/pgboost-project/output/xgBoost_outputs/predictions/xgBoost_tuning_500evals_allParams/predictions_generic_Neurons.tsv")
+pred_neurons_allParams_generic <- fread("/mnt/germain/work/tomohl/pgboost-project/output/xgBoost_outputs/predictions/xgBoost_tuning_500evals_allParams/predictions_tuned_Neurons.tsv")
+
+#pred_neurons <- fread("/mnt/germain/work/tomohl/pgboost-project/output/xgBoost_outputs/predictions/xgBoost_tuning_500evals_allParams/predictions_tuned_Neurons.tsv")
+
+encode <- readRDS("/mnt/germain/datasets/ENCODE_screen_V4_hg38_glutNeurons.rds")
+```
+
+```{r}
+
+pred_list <- rbind(pred_neurons_allParams_tuned, pred_neurons_allParams_generic)
+```
+
+
+
+```{r}
+peak_parts <- strsplit(pred_neurons$peak, "-")
+pred_gr <- GRanges(
+  seqnames = pred_neurons$chr,
+  ranges = IRanges(
+    start = as.numeric(sapply(peak_parts, "[", 2)),
+    end = as.numeric(sapply(peak_parts, "[", 3))
+  ),
+  gene = pred_neurons$gene,
+  prob = pred_neurons$prob,
+  original_idx = seq_len(nrow(pred_neurons))
+)
+
+overlaps <- findOverlaps(pred_gr, encode)
+matching_genes <- pred_gr$gene[queryHits(overlaps)] == encode$gene[subjectHits(overlaps)]
+
+# Get indices of true positives
+true_positive_indices <- unique(queryHits(overlaps)[matching_genes])
+
+# Create true labels (1 = in benchmark, 0 = not in benchmark)
+pred_neurons[, true_label := 0]
+pred_neurons[pred_gr$original_idx[true_positive_indices], true_label := 1]
+
+# Print summary statistics
+cat("Total predictions:", nrow(pred_neurons), "\n")
+cat("True positives (in ENCODE):", sum(pred_neurons$true_label), "\n")
+cat("True negatives (not in ENCODE):", sum(pred_neurons$true_label == 0), "\n")
+cat("Positive rate:", round(mean(pred_neurons$true_label), 4), "\n\n")
+
+pr_obj <- pr.curve(
+  scores.class0 = pred_neurons[true_label == 1, prob],
+  scores.class1 = pred_neurons[true_label == 0, prob],
+  curve = TRUE
+)
+
+pr_curve_data <- pr_obj$curve
+
+pr_df <- data.frame(
+  recall = pr_curve_data[,1],
+  precision = pr_curve_data[,2]
+)
+
+ggplot(pr_df, aes(x = recall, y = precision)) +
+  geom_line(size = 1.2, color = "darkblue") +
+  geom_hline(yintercept = baseline_precision, 
+             linetype = "dashed", color = "red", size = 1) +
+  annotate("text", 
+           x = 0.5, 
+           y = baseline_precision + 0.03,
+           label = paste("Baseline:", round(baseline_precision, 4)),
+           color = "red", size = 3.5) +
+  labs(title = "Precision-Recall Curve",
+       subtitle = paste("AUPRC =", round(pr_obj$auc.integral, 4),
+                       "| Baseline =", round(baseline_precision, 4)),
+       x = "Recall",
+       y = "Precision") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold")) +
+  coord_cartesian(xlim = c(0, 1), ylim = c(0, 1))
+
+```
+# ENRICHMENT ANALYSIS
+```{r}
+
+pred_neurons_sorted <- pred_neurons[order(-prob)]
+pred_neurons_sorted[, cumulative_tp := cumsum(true_label)]
+pred_neurons_sorted[, rank := 1:.N]
+
+
+total_positives <- sum(pred_neurons_sorted$true_label)
+total_predictions <- nrow(pred_neurons_sorted)
+positive_rate <- total_positives / total_predictions
+
+pred_neurons_sorted[, expected_tp := rank * positive_rate]
+pred_neurons_sorted[, enrichment := log2((1 + cumulative_tp) / (1 + expected_tp))]
+
+library(ggplot2)
+
+# Option 1: Plot against rank
+p1 <- ggplot(pred_neurons_sorted, aes(x = rank, y = enrichment)) +
+  geom_line(size = 1, color = "darkblue") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Enrichment Plot",
+       subtitle = paste("True positives:", total_positives, "out of", total_predictions),
+       x = "Rank (sorted by prediction score)",
+       y = "Log2 Fold Enrichment\nlog2((1+observed)/(1+expected))") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"))
+
+print(p1)
+
+# Option 2: Plot against score
+p2 <- ggplot(pred_neurons_sorted, aes(x = prob, y = enrichment)) +
+  geom_line(size = 1, color = "darkgreen") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Enrichment Plot by Score",
+       subtitle = paste("True positives:", total_positives, "out of", total_predictions),
+       x = "Prediction Score (high to low)",
+       y = "Log2 Fold Enrichment\nlog2((1+observed)/(1+expected))") +
+  scale_x_reverse() +  # Reverse x-axis so highest scores are on the left
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"))
+
+print(p2)
+
+
+
+```
+
+```{r fig.width=8, fig.height=6}
+process_and_plot_model <- function(pred_file, model_name, encode_data, color_choice) {
+  pred <- fread(pred_file)
+  peak_parts <- strsplit(pred$peak, "-")
+  pred_gr <- GRanges(
+    seqnames = pred$chr,
+    ranges = IRanges(
+      start = as.numeric(sapply(peak_parts, "[", 2)),
+      end = as.numeric(sapply(peak_parts, "[", 3))
+    ),
+    gene = pred$gene,
+    prob = pred$prob,
+    original_idx = seq_len(nrow(pred))
+  )
+  
+  overlaps <- findOverlaps(pred_gr, encode_data)
+  matching_genes <- pred_gr$gene[queryHits(overlaps)] == encode_data$gene[subjectHits(overlaps)]
+  true_positive_indices <- unique(queryHits(overlaps)[matching_genes])
+  
+  pred[, true_label := 0]
+  pred[pred_gr$original_idx[true_positive_indices], true_label := 1]
+  
+  baseline_precision <- sum(pred$true_label) / nrow(pred)
+  
+  pr_obj <- pr.curve(
+    scores.class0 = pred[true_label == 1, prob],
+    scores.class1 = pred[true_label == 0, prob],
+    curve = TRUE
+  )
+  
+  pred_sorted <- pred[order(-prob)]
+  pred_sorted[, rank := 1:.N]
+  pred_sorted[, percent_rank := 100 * rank / .N]
+  pred_sorted[, cumulative_tp := cumsum(true_label)]
+  positive_rate <- sum(pred_sorted$true_label) / nrow(pred_sorted)
+  pred_sorted[, expected_tp := rank * positive_rate]
+  pred_sorted[, enrichment := log2((1 + cumulative_tp) / (1 + expected_tp))]
+  
+  list(
+    model = model_name,
+    color = color_choice,
+    pr_data = data.frame(
+      recall = pr_obj$curve[,1],
+      precision = pr_obj$curve[,2],
+      model = model_name
+    ),
+    enrichment_data = pred_sorted[, .(percent_rank, enrichment, model = model_name)],
+    auprc = pr_obj$auc.integral,
+    baseline = baseline_precision,
+    n_tp = sum(pred$true_label),
+    n_total = nrow(pred)
+  )
+}
+
+# Process multiple models at once
+models <- list(
+  list(file = "/mnt/germain/work/tomohl/pgboost-project/output/xgBoost_outputs/predictions/xgBoost_tuning_500evals_allParams/predictions_generic_Neurons.tsv",
+       name = "All features - Generic",
+       color = "#1B9E77"),
+  list(file = "/mnt/germain/work/tomohl/pgboost-project/output/xgBoost_outputs/predictions/xgBoost_tuning_500evals_allParams/predictions_tuned_Neurons.tsv",
+       name = "All features - Tuned",
+       color = "blue3"),
+    list(file = "/mnt/germain/work/tomohl/pgboost-project/output/xgBoost_outputs/predictions/XGBoost_pgboostfeatures/predictions_pgboost_Neurons.tsv",
+       name = "pgBoost features",
+       color = "#D95F02")
+)
+
+encode <- readRDS("/mnt/germain/datasets/ENCODE_screen_V4_hg38_glutNeurons.rds")
+all_results <- lapply(models, function(m) {
+  process_and_plot_model(m$file, m$name, encode, m$color)
+})
+
+all_pr_data <- do.call(rbind, lapply(all_results, function(x) x$pr_data))
+
+all_enrichment_data <- do.call(rbind, lapply(all_results, function(x) x$enrichment_data))
+
+p_pr_compare <- ggplot(all_pr_data, aes(x = recall, y = precision, color = model)) +
+  geom_line(size = 1.2) +
+  xlim(0, 0.2) +
+  scale_color_manual(values = sapply(all_results, function(x) x$color)) +
+  geom_hline(
+    yintercept = all_results[[1]]$baseline,
+    linetype = "dashed", color = "gray50", alpha = 0.7
+  ) +
+  labs(
+    title = NULL,  # remove title
+    subtitle = paste(sapply(all_results, function(x)
+      paste0(x$model, ": AUPRC=", round(x$auprc, 3))), collapse = " | "),
+    x = "Recall",
+    y = "Precision",
+    color = NULL
+  ) +
+  theme_bw(base_size = 17, base_family = "montserrat_family") +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    # keep bold subtitle style, no title
+    plot.title = element_blank(),
+    plot.subtitle = element_text(face = "plain", family = "montserrat_family"),
+    axis.text.x = element_text(family = "montserrat_family"),
+    axis.text.y = element_text(family = "montserrat_family"),
+    # legend inside the plotting area
+    legend.position = c(0.98, 0.80),
+    legend.justification = c("right", "bottom"),
+    legend.background = element_rect(fill = scales::alpha("white", 0.8), color = NA),
+    legend.key = element_blank(),
+    legend.direction = "vertical",
+    # remove outer box
+    plot.background = element_blank()
+  )
+p_pr_compare_full <- ggplot(all_pr_data, aes(x = recall, y = precision, color = model)) +
+  geom_line(size = 1.2) +
+  scale_color_manual(values = sapply(all_results, function(x) x$color)) +
+  geom_hline(
+    yintercept = all_results[[1]]$baseline,
+    linetype = "dashed", color = "gray50", alpha = 0.7
+  ) +
+  labs(
+    title = NULL,  # remove title
+    subtitle = paste(sapply(all_results, function(x)
+      paste0(x$model, ": AUPRC=", round(x$auprc, 3))), collapse = " | "),
+    x = "Recall",
+    y = "Precision",
+    color = NULL
+  ) +
+  theme_bw(base_size = 17, base_family = "montserrat_family") +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    # keep bold subtitle style, no title
+    plot.title = element_blank(),
+    plot.subtitle = element_text(face = "plain", family = "montserrat_family"),
+    axis.text.x = element_text(family = "montserrat_family"),
+    axis.text.y = element_text(family = "montserrat_family"),
+    # legend inside the plotting area
+    legend.position = c(0.98, 0.80),
+    legend.justification = c("right", "bottom"),
+    legend.background = element_rect(fill = scales::alpha("white", 0.8), color = NA),
+    legend.key = element_blank(),
+    legend.direction = "vertical",
+    # remove outer box
+    plot.background = element_blank()
+  )
+
+p_pr_compare
+p_pr_compare_full
+
+
+p_enrich_compare <- ggplot(all_enrichment_data, aes(x = percent_rank, y = enrichment, color = model)) +
+  geom_line(size = 1.2) +
+  scale_color_manual(values = sapply(all_results, function(x) x$color)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(title = "Enrichment Plots Comparison",
+       subtitle = paste(sapply(all_results, function(x) 
+         paste0(x$model, ": ", x$n_tp, " TPs")), collapse = " | "),
+       x = "Percentage of Predictions (sorted by score)",
+       y = "Log2 Fold Enrichment") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"),
+        legend.position = "bottom") +
+  coord_cartesian(xlim = c(0, 50))  
+print(p_enrich_compare)
+
+
+
+for(res in all_results) {
+  cat("\n", res$model, ":\n", sep="")
+  cat("  AUPRC:", round(res$auprc, 4), "\n")
+  cat("  True Positives:", res$n_tp, "/", res$n_total, 
+      "(", round(100*res$n_tp/res$n_total, 2), "%)\n", sep="")
+}
+```
+```{r}
+# 1) Load and keep only what's needed from the raw feature table
+feat <- fread("/mnt/germain/work/tomohl/pgboost-project/output/xgBoost_outputs/data_noSNP.tsv")[
+  , .(peak, gene, peak_gene_distance, celltype)
+]
+
+# 2) Deduplicate (in case the same peak–gene appears multiple times in the raw table)
+#    If there are multiple distances per pair, take the median to be robust.
+feat_agg <- feat[, .(peak_gene_distance = median(peak_gene_distance, na.rm = TRUE)), by = .(peak, gene, celltype)]
+
+# 3) Merge predictions with the (deduped) feature distances
+test <- merge(pred_neurons_allParams_tuned, feat_agg, by = c("peak", "gene", "celltype"), all.x = TRUE)
+
+# 4) Quick sanity checks
+test[, dups := .N, by = .(peak, gene, celltype)]
+message("Rows after merge: ", nrow(test))
+message("Missing distances: ", sum(is.na(test$peak_gene_distance)))
+message("Any duplicated peak–gene pairs post-merge? ", any(test$dups > 1))
+
+# 5) Plot: probability vs distance (log-scaled distance helps)
+ggplot(test[!is.na(peak_gene_distance)], aes(x = peak_gene_distance, y = prob)) +
+  geom_hex(bins = 60) +
+  scale_fill_viridis_c(option = "C", direction = -1) +
+  geom_smooth(method = "loess", color = "white", size = 1.2) +
+  scale_x_log10() +
+  labs(
+    x = "Peak–gene distance (bp, log scale)",
+    y = "Predicted probability",
+    subtitle = "Density of predicted links by genomic distance"
+  ) +
+  theme_bw(base_size = 16) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+

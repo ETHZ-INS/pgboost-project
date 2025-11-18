@@ -363,26 +363,140 @@ fwrite(ablation_tbl, file.path(model_dir, "ablation_summary.tsv"), sep = "\t")
 ```
 
 # 10. Plot
+```{r fig.width= 10, fig.height=5}
+ablation_tbl <- fread(file.path(model_dir, "ablation_summary.tsv"))
+
+# Human-readable group names
+group_labels <- c(
+  distance      = "Distance features",
+  acc_mean      = "Chromatin accessibility (mean)",
+  acc_var       = "Chromatin accessibility (variance)",
+  coaccess      = "Regulatory linkage features\n(SCENT, Cicero, Signac)",
+  motif_arch    = "Motif architecture",
+  predEnhancer  = "Predicted enhancer activity",
+  topology_3d   = "3D genome topology",
+  conservation  = "Sequence conservation",
+  gene_expr     = "Gene expression"
+)
+
+# Apply labels
+ablation_tbl[, group := group_labels[group]]
+
+# Explicitly order by d_auprc (lowest first)
+ablation_tbl[, group := factor(group, levels = group[order(d_auprc)])]
+
+# Plot
+ggplot(ablation_tbl,
+       aes(x = group, y = d_auprc)) +  # no reorder() here
+  geom_col(fill = "#1b9e77", alpha = 0.8, width = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  coord_flip() +
+  labs(
+    x = "Feature group removed",
+    y = expression(Delta~"AUPRC"),
+    title = "Feature Ablation: Change in AUPRC",
+    subtitle = "Performance drop relative to baseline model"
+  ) +
+  theme_bw(base_size = 15, base_family = "montserrat_family") +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", family = "montserrat_family"),
+    axis.text.y = element_text(family = "montserrat_family"),
+    axis.text.x = element_text(family = "montserrat_family")
+  )
+
+```
+
+# Plots for thesis
+```{r fig.height = 10, fig.width= 10}
+library(data.table)
+library(ggplot2)
+library(GGally)  # for ggcorr / ggpairs
+library(corrplot)  # for correlation heatmaps
+
+# Select features only
+feature_cols <- baseline_feats  # the same features used for training
+feature_data <- data[, ..feature_cols]
+
+# Remove any non-numeric columns
+feature_data <- feature_data[, which(sapply(feature_data, is.numeric)), with = FALSE]
+
+cor_mat <- cor(feature_data, use = "pairwise.complete.obs", method = "spearman")
+
+# Define a mapping
+feature_labels <- c(
+  peak_gene_distance = "Distance from peak to gene",
+  closest_tss        = "Binary value for closest connection",
+  distNearest_peakCentric = "Candidate-centric distance",
+  ATACmean           = "ATAC mean signal",
+  ATACvariance       = "ATAC variance",
+  cicero             = "Cicero",
+  scent              = "SCENT",
+  signac             = "Signac",
+  rex                = "Range extender motifs",
+  predEnhancer_g_exp_beta  = "PredEnhancer β (gene exp)",
+  predEnhancer_g_lin_beta  = "PredEnhancer β (linear)",
+  predEnhancer_p_exp_beta  = "PredEnhancer β (peak exp)",
+  predEnhancer_p_lin_beta  = "PredEnhancer β (peak linear)",
+  predEnhancer_g_exp_score  = "PredEnhancer score (gene exp)",
+  predEnhancer_g_lin_score  = "PredEnhancer score (linear)",
+  predEnhancer_p_exp_score = "PredEnhancer score (peak exp)",
+  predEnhancer_p_lin_score  = "PredEnhancer score (peak linear)",
+  tad_sum_score      = "TAD sum score",
+  tad_n_boundaries = "TAD boundaries crossed",
+  tad_pyt_score = "TAD pythagorean score",
+  conservation        = "Sequence conservation",
+  gene_logCPM         = "Gene expression logCPM",
+  peak_logCPM = "Peak logCPM"
+)
+
+# Apply renaming
+new_names <- ifelse(names(feature_labels) %in% colnames(cor_mat),
+                    feature_labels[colnames(cor_mat)],
+                    colnames(cor_mat))
+rownames(cor_mat) <- new_names
+colnames(cor_mat) <- new_names
+
+corrplot(
+  cor_mat,
+  method = "color",
+  type = "lower",                # show only lower triangle
+  order = "hclust",              # cluster features
+  col = colorRampPalette(c("steelblue3", "white", "firebrick3"))(200),
+  tl.col = "black",              # text color
+  tl.srt = 0,                    # keep feature names horizontal
+  tl.pos = "l",                  # label only on the left
+  cl.pos = "n",                  # remove color scale legend
+  mar = c(0, 0, 2, 0),
+  title = "Feature correlation matrix (Spearman)"
+)
+```
 ```{r}
-ablation_tbl
+feature_data2 <- feature_data[, c("cicero", "signac", "scent")]
 
-p_glob <- ggplot(ablation_tbl, aes(x = reorder(group, d_enrich_global), y = d_enrich_global)) +
-  geom_col(fill = "steelblue") +
-  geom_hline(yintercept = 0, linetype = 2) +
-  coord_flip() +
-  labs(x = "Feature group removed", y = "Δ Average Enrichment (global)") +
-  theme_bw(base_size = 12)
+cor_mat <- cor(feature_data2, use = "pairwise.complete.obs", method = "spearman")
 
-p_restr <- ggplot(ablation_tbl, aes(x = reorder(group, d_enrich_restrict), y = d_enrich_restrict)) +
-  geom_col(fill = "darkred") +
-  geom_hline(yintercept = 0, linetype = 2) +
-  coord_flip() +
-  labs(x = "Feature group removed", y = "Δ Average Enrichment (restricted SNPs)") +
-  theme_bw(base_size = 12)
+# Apply renaming
+new_names <- ifelse(names(feature_labels) %in% colnames(cor_mat),
+                    feature_labels[colnames(cor_mat)],
+                    colnames(cor_mat))
+rownames(cor_mat) <- new_names
+colnames(cor_mat) <- new_names
 
-ggsave(file.path(model_dir, "ablation_delta_enrichment_global.png"), p_glob, width = 6, height = 4, dpi = 300)
-ggsave(file.path(model_dir, "ablation_delta_enrichment_restricted.png"), p_restr, width = 6, height = 4, dpi = 300)
-
+corrplot(
+  cor_mat,
+  method = "color",
+  type = "lower",                # show only lower triangle
+  order = "hclust",              # cluster features
+  col = colorRampPalette(c("steelblue3", "white", "firebrick3"))(200),
+  tl.col = "black",              # text color
+  tl.srt = 0,                    # keep feature names horizontal
+  tl.pos = "l",                  # label only on the left
+  cl.pos = "n",                  # remove color scale legend
+  mar = c(0, 0, 2, 0),
+  title = "Feature correlation matrix (Spearman)"
+)
 
 ```
 

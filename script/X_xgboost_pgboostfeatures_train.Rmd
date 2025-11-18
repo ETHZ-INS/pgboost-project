@@ -1,0 +1,1033 @@
+---
+title: "X_xgboost_pgboostfeatures_train.Rmd"
+author: "tobiasmohl"
+date: "2025-11-02"
+output: html_document
+---
+
+# 1. Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(xgboost)
+  library(dplyr)
+  library(ggplot2)
+  library(PRROC)
+})
+
+set.seed(187)
+
+SCRIPT_DIR   <- getwd()
+PROJECT_ROOT <- normalizePath(file.path(SCRIPT_DIR, ".."), mustWork = FALSE)
+
+OUTPUT_DIR <- file.path(PROJECT_ROOT, "output")
+XGB_DIR    <- file.path(OUTPUT_DIR, "xgBoost_outputs")
+TUNING_DIR <- file.path(XGB_DIR, "tuning")
+PRED_DIR   <- file.path(XGB_DIR, "predictions")
+MODEL_DIR  <- file.path(XGB_DIR, "models")
+
+run_name <- "XGBoost_allfeatures"
+
+data_file      <- file.path(XGB_DIR, "data_noSNP.tsv")
+training_file  <- file.path(PROJECT_ROOT, "data", "eqtl_files", "training_data_snppg_aggregated_new.tsv.gz")
+predictor_file <- file.path(XGB_DIR, "predictors.txt")
+
+model_dir <- file.path(MODEL_DIR, run_name)
+pred_dir  <- file.path(PRED_DIR,  run_name)
+dir.create(model_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(pred_dir,  recursive = TRUE, showWarnings = FALSE)
+
+feat_out <- file.path(model_dir, "feature_names.txt")
+outfile  <- file.path(TUNING_DIR, run_name)
+dir.create(outfile,  recursive = TRUE, showWarnings = FALSE)
+
+```
+
+# 2. Preparation
+```{r}
+full_data <- fread(data_file)
+training_data <- fread(training_file)
+```
+
+# 3.
+```{r}
+ct_map <- c(
+  Ast = "astrocytes",
+  MG  = "Microglia",
+  OD  = "Oligodendrocytes",
+  OPC = "OPC",
+  IN  = "Neurons",     # fuse IN  → Neurons
+  Ext = "Neurons",     # fuse Ext → Neurons
+  End = "Endothelial"
+)
+
+remap_ct <- function(x) ifelse(x %in% names(ct_map), ct_map[x], x)
+
+training_data[, celltype := remap_ct(celltype)]
+full_data[,     celltype := remap_ct(celltype)]
+
+full_data[, chr := tstrsplit(peak, "-", keep = 1L)]
+training_data[, chr := tstrsplit(peak, "-", keep = 1L)]
+
+# Merge on full identity
+index_cols <- c("peak", "gene", "celltype", "chr")
+setkeyv(full_data, index_cols)
+setkeyv(training_data, index_cols)
+data <- full_data[training_data, nomatch = 0L]
+
+# Labels: 1 = pos, 2 = strong neg -> make 0/1
+data[label == 2L, label := 0L]
+data <- data[label %in% c(0L, 1L)]
+
+cat(sprintf("Number of training instances: %s\n", nrow(data)))
+cat(sprintf("Number of positives: %s\n", sum(data$label == 1L)))
+cat(sprintf("Number of negatives: %s\n\n", sum(data$label == 0L)))
+
+
+celltypes <- sort(unique(data$celltype))
+
+```
+
+```{r}
+# --- Define pgBoost-only parameters ---
+pgboost_params <- list(
+  booster           = "gbtree",
+  objective         = "binary:logistic",
+  eval_metric       = "aucpr",
+  max_depth = 15,
+  eta = 0.05,
+  gamma = 10,
+  min_child_weight = 8,
+  nthread = 4,
+  scale_pos_weight = 1,
+  subsample = 0.8)
+
+pgboost_features <- c("cicero", "signac", "scent", "peak_gene_distance", "closest_tss")
+pgboost_features <- intersect(pgboost_features, names(data))  # ensure they exist
+
+```
+
+```{r}
+train_xgb <- function(X, y, params, folds, max_nrounds = 500) {
+  params$nrounds     <- NULL
+  params$nthread     <- NULL
+  params$objective   <- "binary:logistic"
+  params$eval_metric <- "aucpr"
+  
+  dtrain <- xgb.DMatrix(as.matrix(X), label = y)
+  
+  # Cross-validation by chromosome
+  cv <- xgb.cv(
+    data = dtrain,
+    params = params,
+    nrounds = max_nrounds,
+    folds = folds,
+    nthread = 8,
+    early_stopping_rounds = 10,
+    verbose = 1
+  )
+  
+  best_nrounds <- cv$best_iteration
+  
+  bst <- xgb.train(
+    params  = params,
+    data    = dtrain,
+    nrounds = best_nrounds,
+    nthread = 8,
+    verbose = 1
+  )
+  
+  list(model = bst, best_nrounds = best_nrounds)
+}
+
+
+predict_and_score <- function(model_obj, X_test, y_test) {
+  bst <- if (is.list(model_obj)) model_obj$model else model_obj
+  p_hat <- predict(bst, as.matrix(X_test))
+  
+  logloss <- -mean(y_test * log(p_hat + 1e-15) + (1 - y_test) * log(1 - p_hat + 1e-15))
+  pr <- PRROC::pr.curve(scores.class0 = p_hat[y_test == 1],
+                        scores.class1 = p_hat[y_test == 0],
+                        curve = FALSE)
+  
+  list(
+    preds = data.table(prob = p_hat, label = y_test),
+    metrics = list(logloss = logloss, auprc = pr$auc.integral)
+  )
+}
+
+```
+
+```{r}
+results_pgboost <- list()
+
+for (ct in celltypes) {
+  message("Held-out cell type (pgBoost-only): ", ct)
+  
+  train_idx <- data$celltype != ct
+  test_idx  <- data$celltype == ct
+  
+  X_train <- data[train_idx, ..pgboost_features]
+  y_train <- data$label[train_idx]
+  chr_train <- data$chr[train_idx]
+  
+  X_test <- data[test_idx, ..pgboost_features]
+  y_test <- data$label[test_idx]
+  
+  # --- Chromosome folds ---
+  folds <- split(seq_along(chr_train), chr_train)
+  
+  # --- Train model ---
+  pgboost_model <- train_xgb(X_train, y_train, pgboost_params, folds = folds, max_nrounds = 500)
+  
+  # --- Save model ---
+  xgb.save(pgboost_model$model,
+         fname = file.path(model_dir, paste0("xgb_pgboost_", ct, ".model")))
+  
+  # --- Predict + score ---
+  res_pgboost <- predict_and_score(pgboost_model, X_test, y_test)
+  
+  # --- Save predictions ---
+  preds_pgboost <- cbind(
+  data[test_idx, .(peak, gene, chr, celltype)],
+  model = "pgBoost-only",
+  res_pgboost$preds
+)
+
+  fwrite(
+    preds_pgboost,
+    file = file.path(pred_dir, paste0("predictions_pgboost_", ct, ".tsv")),
+    sep = "\t"
+  )
+  
+  # --- Store summary metrics ---
+  results_pgboost[[ct]] <- list(
+    pgboost = res_pgboost$metrics
+  )
+}
+
+saveRDS(results_pgboost, file = file.path(pred_dir, "summary_metrics_pgboost.rds"))
+
+```
+```{r}
+library(data.table)
+library(PRROC)
+library(ggplot2)
+
+# --- Directories ---
+tuned_pred_dir   <- file.path(PRED_DIR, "xgBoost_tuning_500evals_allParams")
+pgboost_pred_dir <- file.path(PRED_DIR, "XGBoost_pgboostfeatures")
+
+# --- Read all predictions ---
+tuned_files   <- list.files(tuned_pred_dir,   pattern = "^predictions_tuned_.*\\.tsv$", full.names = TRUE)
+pgboost_files <- list.files(pgboost_pred_dir, pattern = "^predictions_pgboost_.*\\.tsv$", full.names = TRUE)
+
+tuned_preds   <- rbindlist(lapply(tuned_files, fread))
+pgboost_preds <- rbindlist(lapply(pgboost_files, fread))
+
+tuned_preds[, model := "tuned model"]
+pgboost_preds[, model := "pgBoost-only"]
+
+# Combine
+all_preds <- rbindlist(list(tuned_preds, pgboost_preds), fill = TRUE)
+
+# Sanity check
+head(all_preds)
+
+```
+```{r}
+compute_pr_curve <- function(dt) {
+  pos <- dt$prob[dt$label == 1]
+  neg <- dt$prob[dt$label == 0]
+  if (length(pos) == 0 || length(neg) == 0) return(NULL)
+  pr <- PRROC::pr.curve(scores.class0 = pos, scores.class1 = neg, curve = TRUE)
+  data.table(
+    recall = pr$curve[,1],
+    precision = pr$curve[,2],
+    aucpr = pr$auc.integral,
+    n_pos = sum(dt$label == 1),
+    n_neg = sum(dt$label == 0)
+  )
+}
+
+pr_curves <- all_preds[, compute_pr_curve(.SD), by = .(celltype, model)]
+pr_curves_summary <- pr_curves[, .(AUPRC = unique(aucpr)), by = .(celltype, model)]
+
+print(pr_curves_summary)
+
+```
+
+```{r fig.height= 6.5, fig.width= 8}
+library(ggplot2)
+
+# --- rename models for clarity ---
+pr_curves_summary[, model := fifelse(model == "pgBoost-only", "pgBoost features",
+                              fifelse(model == "tuned model", "All features", model))]
+
+# --- capitalize cell types properly ---
+capitalize_first <- function(x) {
+  sapply(x, function(s) {
+    if (toupper(s) == "OPC") return("OPC")
+    paste0(toupper(substring(s, 1, 1)), substring(s, 2))
+  })
+}
+pr_curves_summary[, celltype := capitalize_first(celltype)]
+
+# --- plotting ---
+ggplot(pr_curves_summary,
+       aes(x = celltype, y = AUPRC,
+           fill = model, colour = model)) +
+  geom_bar(stat = "identity",
+           position = position_dodge(width = 0.8),
+           width = 0.6,
+           alpha = 0.7) +
+  geom_text(aes(label = sprintf("%.2f", AUPRC)),
+            position = position_dodge(0.8),
+            vjust = -0.5,
+            size = 3,
+            colour = "gray25",
+            show.legend = FALSE,
+            family = "montserrat_family") +
+  labs(
+    x = "Cell Type",
+    y = "AUPRC",
+    fill = NULL,
+    colour = NULL,
+    title = "Model Performance Across Cell Types",
+    subtitle = "All features vs. pgBoost features"
+  ) +
+  theme_bw(base_size = 15, base_family = "montserrat_family") +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x   = element_text(angle = 45, hjust = 1,
+                                 family = "montserrat_family"),
+    axis.text.y   = element_text(family = "montserrat_family"),
+    axis.title    = element_text(family = "montserrat_family"),
+    legend.text   = element_text(size = 9, family = "montserrat_family"),
+    legend.position = c(0.12, 0.85),
+    legend.background = element_rect(fill = "transparent", colour = NA),
+    legend.key.spacing.y = unit(0.09, "cm"), 
+    legend.key.size = unit(1, "lines"),
+    strip.text    = element_text(size = 14, family = "montserrat_family"),
+    plot.title    = element_text(family = "montserrat_family", face = "bold")
+  ) +
+  ylim(0, 1) +
+  scale_fill_brewer(palette = "Dark2") +
+  scale_color_brewer(palette = "Dark2")
+```
+```{r fig.width= 7, fig.height=5}
+pr_curves_all <- data.table::copy(pr_curves)
+
+# --- 1. Aggregate PR curves across cell types ---
+pr_curves_all[, recall_bin := round(recall, 2)]  # bins of 0.01 steps
+agg_pr <- pr_curves_all[, .(
+  mean_precision = mean(precision, na.rm = TRUE),
+  sd_precision   = sd(precision, na.rm = TRUE),
+  n_ct           = uniqueN(celltype)
+), by = .(model, recall_bin)]
+
+# --- 2. Rename models for clarity ---
+agg_pr[, model := fifelse(model == "pgBoost-only", "pgBoost features",
+                   fifelse(model == "tuned model", "All features", model))]
+
+# --- 3. Compute mean AUPRC per model ---
+auprc_summary <- pr_curves_all[, .(mean_aucpr = mean(unique(aucpr))), by = model]
+auprc_summary[, model := fifelse(model == "pgBoost-only", "pgBoost features",
+                          fifelse(model == "tuned model", "All features", model))]
+
+# --- 4. Enforce consistent color order ---
+model_levels <- c("All features", "pgBoost features")
+agg_pr[, model := factor(model, levels = model_levels)]
+auprc_summary[, model := factor(model, levels = model_levels)]
+
+# --- 5. Define label positions for annotations ---
+auprc_summary[, y_pos := seq(0.10, 0.05, length.out = .N)]
+auprc_summary[, x_pos := 0.02]  # place text near bottom-left
+
+# --- 6. Plot ---
+ggplot(agg_pr, aes(x = recall_bin, y = mean_precision,
+                   color = model)) +
+  geom_line(linewidth = 1.5) +
+  labs(
+    x = "Recall",
+    y = "Precision",
+    color = NULL,
+    title = "Aggregated Precision–Recall Trajectories",
+    subtitle = sprintf("Mean ± SD across %d cell types", unique(agg_pr$n_ct))
+  ) +
+  theme_bw(base_size = 15, base_family = "montserrat_family") +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x   = element_text(family = "montserrat_family"),
+    axis.text.y   = element_text(family = "montserrat_family"),
+    axis.title    = element_text(family = "montserrat_family"),
+    legend.position = "none",
+    plot.title    = element_text(family = "montserrat_family", face = "bold"),
+    plot.subtitle = element_text(family = "montserrat_family", margin = margin(b = 10))
+  ) +
+  scale_color_brewer(palette = "Dark2") +
+  coord_cartesian(ylim = c(0, 1)) +
+
+  # --- 7. AUPRC text annotations (color-matched) ---
+  geom_text(
+    data = auprc_summary,
+    aes(x = x_pos, y = y_pos,
+        label = sprintf("%s  (AUPRC = %.2f)", model, mean_aucpr),
+        color = model),
+    inherit.aes = FALSE,
+    show.legend = FALSE,
+    hjust = 0,
+    size = 4,
+    family = "montserrat_family"
+  )
+
+```
+
+# Distance based
+```{r}
+pgboost_pred_dir   <- file.path(PRED_DIR, "XGBoost_pgboostfeatures")
+consensus_pred_dir <- file.path(PRED_DIR, "xgBoost_tuning_500evals_allParams_new")
+
+pgboost_files   <- list.files(pgboost_pred_dir, pattern = "^predictions_pgboost_.*\\.tsv$", full.names = TRUE)
+consensus_files <- list.files(consensus_pred_dir, pattern = "^predictions_tuned_.*\\.tsv$", full.names = TRUE)
+
+pgboost_preds <- if (length(pgboost_files)) rbindlist(lapply(pgboost_files, fread), fill = TRUE) else data.table()
+consensus_preds <- if (length(consensus_files)) rbindlist(lapply(consensus_files, fread), fill = TRUE) else data.table()
+
+if (nrow(pgboost_preds))   pgboost_preds[,   model := "pgBoost features"]
+if (nrow(consensus_preds)) consensus_preds[, model := "All features"]
+
+all_preds <- rbindlist(list(pgboost_preds, consensus_preds), fill = TRUE)
+
+key_cols <- c("peak", "gene", "celltype", "chr")
+if (all(key_cols %in% names(data))) {
+  all_preds <- merge(
+    all_preds,
+    data[, .(peak, gene, celltype, chr, peak_gene_distance, closest_tss)],
+    by = key_cols,
+    all.x = TRUE
+  )
+}
+
+# --- Compute log-distance bins ---
+all_preds[, log_distance := log10(peak_gene_distance + 1)]
+all_preds <- all_preds[is.finite(log_distance)]
+
+all_preds[, dist_bin := cut(
+  log_distance, breaks = seq(3, 7, by = 0.2),
+  include.lowest = TRUE, labels = FALSE
+)]
+
+# --- AUPRC per distance bin (global) ---
+compute_bin_auprc <- function(dt) {
+  if (length(unique(dt$label)) < 2) return(NA_real_)
+  pr <- PRROC::pr.curve(
+    scores.class0 = dt$prob[dt$label == 1],
+    scores.class1 = dt$prob[dt$label == 0],
+    curve = FALSE
+  )
+  pr$auc.integral
+}
+
+# Bin midpoints for plotting
+bin_breaks <- seq(3, 7, by = 0.2)
+bin_mids <- bin_breaks[-1] - 0.1
+
+# PLOT 1: GLOBAL (pooled)
+dist_perf_global <- all_preds[, .(AUPRC = compute_bin_auprc(.SD)), by = .(model, dist_bin)]
+dist_perf_global[, dist_mid := 10^bin_mids[dist_bin]]
+
+p1 <- ggplot(dist_perf_global, aes(x = dist_mid, y = AUPRC, color = model)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  scale_x_log10(
+    breaks = c(1e3, 1e4, 1e5, 5e5),
+    labels = c("1 kb", "10 kb", "100 kb", "500 kb")
+  ) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    x = "Genomic distance (peak–TSS)",
+    y = "AUPRC",
+    title = "Global (pooled across cell types)"
+  ) +
+  scale_color_manual(values = c("All features" = "#1b9e77", "pgBoost features" = "#d95f02")) +
+  theme_classic(base_size = 14, base_family = "montserrat_family") +
+  theme(
+    legend.title = element_blank(),
+    legend.position = c(0.8, 0.85),
+    legend.background = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+
+# PLOT 2: MEAN across cell types
+
+dist_perf_ct <- all_preds[, .(AUPRC = compute_bin_auprc(.SD)), by = .(model, celltype, dist_bin)]
+agg_perf <- dist_perf_ct[, .(
+  mean_AUPRC = mean(AUPRC, na.rm = TRUE),
+  sd_AUPRC   = sd(AUPRC, na.rm = TRUE)
+), by = .(model, dist_bin)]
+agg_perf[, dist_mid := 10^bin_mids[dist_bin]]
+
+p2 <- ggplot(agg_perf, aes(x = dist_mid, y = mean_AUPRC, color = model)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  scale_x_log10(
+    breaks = c(1e3, 1e4, 1e5, 5e5),
+    labels = c("1 kb", "10 kb", "100 kb", "500 kb")
+  ) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    x = "Genomic distance (peak–TSS)",
+    y = "Mean AUPRC",
+    title = "Mean AUPRC across cell types"
+  ) +
+  scale_color_manual(values = c("All features" = "#1b9e77", "pgBoost features" = "#d95f02")) +
+  theme_classic(base_size = 14, base_family = "montserrat_family") +
+  theme(
+    legend.title = element_blank(),
+    legend.position = c(0.8, 0.85),
+    legend.background = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+# -------------------------------
+# Display both
+# -------------------------------
+library(patchwork)
+p1 + p2 + plot_layout(ncol = 2)
+
+
+
+```
+
+```{r}
+# 1️⃣ Global (pooled)
+mean_auprc_global <- dist_perf_global[, .(
+  mean_overall_AUPRC = mean(AUPRC, na.rm = TRUE),
+  sd_overall_AUPRC   = sd(AUPRC, na.rm = TRUE)
+), by = model]
+mean_auprc_global[, variant := "Global (pooled across CTs)"]
+
+# 2️⃣ Mean across cell types
+mean_auprc_ct <- agg_perf[, .(
+  mean_overall_AUPRC = mean(mean_AUPRC, na.rm = TRUE),
+  sd_overall_AUPRC   = sd(mean_AUPRC, na.rm = TRUE)
+), by = model]
+mean_auprc_ct[, variant := "Mean across cell types"]
+
+# 3️⃣ Combine both
+mean_auprc_summary <- rbindlist(list(mean_auprc_global, mean_auprc_ct), use.names = TRUE)
+setcolorder(mean_auprc_summary, c("variant", "model", "mean_overall_AUPRC", "sd_overall_AUPRC"))
+
+# 4️⃣ Print nicely formatted table
+print(mean_auprc_summary)
+```
+
+```{r}
+ggplot(data, aes(x = peak_gene_distance)) +
+  geom_histogram(
+    bins = 60,
+    fill = "#1b9e77",
+    color = "white",
+    alpha = 0.8
+  ) +
+  scale_x_log10(
+    breaks = c(1e3, 5e3, 1e4, 5e4, 1e5, 2.5e5, 5e5),
+    labels = c("1 kb", "5 kb", "10 kb", "50 kb", "100 kb", "250 kb", "500 kb"),
+    name = "Peak–gene distance"
+  )+
+  labs(
+    x = "Peak–gene distance",
+    y = "Number of peak–gene links",
+    title = "Distribution of genomic distances between peaks and genes",
+    subtitle = sprintf("n = %s candidate links", format(nrow(data), big.mark = ",")),
+  ) +
+  theme_bw(base_size = 15, base_family = "montserrat_family") +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", family = "montserrat_family"),
+    axis.text   = element_text(family = "montserrat_family"),
+    axis.title  = element_text(family = "montserrat_family")
+  )
+
+ggplot(data, aes(x = peak_gene_distance)) +
+  stat_ecdf(geom = "line", color = "#d95f02", linewidth = 1.2) +
+  scale_x_log10(
+    breaks = c(1e3, 1e4, 1e5, 1e6),
+    labels = c("1 kb", "10 kb", "100 kb", "1 Mb")
+  ) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    x = "Peak–gene distance",
+    y = "Cumulative fraction of links",
+    title = "Cumulative distribution of peak–gene distances",
+    subtitle = sprintf("n = %s candidate links", format(nrow(data), big.mark = ",")),
+  ) +
+  theme_bw(base_size = 15, base_family = "montserrat_family") +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", family = "montserrat_family"),
+    axis.text   = element_text(family = "montserrat_family"),
+    axis.title  = element_text(family = "montserrat_family")
+  )
+```
+```{r fig.width = 14, fig.height= 5}
+library(EnsDb.Hsapiens.v86)
+library(data.table)
+library(GenomicRanges)
+
+# 1. Read your eQTL data
+eqtl_dt <- fread("/mnt/germain/work/tomohl/pgboost-project/data/eqtl_files/training_data_snppg_aggregated_new.tsv.gz")
+eqtl_dt[, c("chr", "start", "end") := tstrsplit(peak, "-", fixed = TRUE)]
+eqtl_dt[, `:=`(start = as.numeric(start), end = as.numeric(end))]
+eqtl_dt[, peak_mid := (start + end) / 2]
+eqtl_dt[, gene_id_clean := sub("\\..*", "", gene_id)]
+
+# --- Normalize chromosomes ---
+eqtl_dt[, chr := sub("^chr", "", chr)]   # remove "chr" prefix
+
+# 2. Extract gene coordinates from EnsDb
+gene_coords <- genes(EnsDb.Hsapiens.v86, columns = "gene_id")
+
+gene_dt <- data.table(
+  gene_id = gene_coords$gene_id,
+  chr = as.character(seqnames(gene_coords)),
+  gene_start = start(gene_coords),
+  gene_end = end(gene_coords),
+  strand = as.character(strand(gene_coords))
+)
+
+# 3. Merge (now names match!)
+eqtl_dt <- merge(
+  eqtl_dt,
+  gene_dt,
+  by.x = c("gene_id_clean", "chr"),
+  by.y = c("gene_id", "chr"),
+  all.x = TRUE
+)
+
+# 4. Compute TSS + distance
+eqtl_dt[, gene_tss := ifelse(strand == "-", gene_end, gene_start)]
+eqtl_dt[, distance_bp := abs(peak_mid - gene_tss)]
+
+
+ggplot(eqtl_dt, aes(x = distance_bp, fill = factor(label))) +
+  geom_histogram(bins = 60, alpha = 1) +
+  scale_x_log10(
+    breaks = c(1e3, 1e4, 1e5, 5e5),
+    labels = c("1 kb", "10 kb", "100 kb", "500 kb")
+  ) +
+  scale_fill_brewer(
+    palette = "Dark2",
+    name = "Label",
+    labels = c("1" = "Positive", "2" = "Negative", "3" = "Unclassified")
+  ) +
+  facet_wrap(~factor(label,
+                    levels = c(1, 2, 3),
+                    labels = c("Positive", "Negative", "Unclassified")),
+             scales = "free_y") +
+  labs(
+    x = "Genomic distance (peak–TSS)",
+    y = "Number of eQTL links",
+    title = "Distribution of eQTL link distances per label"
+  ) +
+  theme_bw(base_size = 15, base_family = "montserrat_family") +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", family = "montserrat_family"),
+    # Add this line to move the legend to the bottom
+    legend.position = "bottom" 
+  )
+
+```
+```{r}
+cand_dir <- "/mnt/germain/work/tomohl/pgboost-mouse/output/candidates"
+cand_files <- list.files(cand_dir, pattern = "^candidates_.*\\.tsv$", full.names = TRUE)
+
+# Read just one file (they're all identical)
+cand_dt <- fread(cand_files[1])
+
+# Compute midpoint and distance to TSS
+cand_dt[, peak_mid := (peak_start + peak_end) / 2]
+cand_dt[, distance_bp := abs(peak_mid - tss)]
+cand_dt <- cand_dt[!is.na(distance_bp) & distance_bp > 0]
+
+# Summary
+summary(cand_dt$distance_bp)
+
+# Plot
+ggplot(cand_dt, aes(x = distance_bp)) +
+  geom_histogram(bins = 80, fill = "#1b9e77", alpha = 0.8) +
+  scale_x_log10(
+    limits = c(1e3, 5e5),
+    breaks = c(1e3, 5e3, 1e4, 5e4, 1e5, 5e5),
+    labels = c("1 kb", "5 kb", "10 kb", "50 kb", "100 kb", "500 kb")
+  ) +
+  labs(
+    x = "Distance between peak midpoint and gene TSS",
+    y = "Number of candidate links",
+    title = "Distribution of genomic distances (zoomed ≤200 kb)"
+  ) +
+  theme_bw(base_size = 15, base_family = "montserrat_family")
+```
+# SHAP-based feature contribution vs. distance
+```{r fig.height= 7.5, fig.width = 17}
+xgb_model <- xgb.load(
+  "/mnt/germain/work/tomohl/pgboost-project/output/xgBoost_outputs/models/consensus_models/xgb_consensus_allfeatures.model")
+
+full_data     <- fread(data_file)
+training_data <- fread(training_file)
+
+# --- Harmonize cell type naming ----------------------------------------------
+
+ct_map <- c(
+  Ast = "astrocytes",
+  MG  = "Microglia",
+  OD  = "Oligodendrocytes",
+  OPC = "OPC",
+  IN  = "Neurons",
+  Ext = "Neurons",
+  End = "Endothelial"
+)
+remap_ct <- function(x) ifelse(x %in% names(ct_map), ct_map[x], x)
+training_data[, celltype := remap_ct(celltype)]
+full_data[,     celltype := remap_ct(celltype)]
+
+# --- Merge training subset with features -------------------------------------
+
+full_data[, chr := tstrsplit(peak, "-", keep = 1L)]
+training_data[, chr := tstrsplit(peak, "-", keep = 1L)]
+
+index_cols <- c("peak", "gene", "celltype", "chr")
+setkeyv(full_data, index_cols)
+setkeyv(training_data, index_cols)
+data <- full_data[training_data, nomatch = 0L]
+
+# --- Prepare labels -----------------------------------------------------------
+
+data[label == 2L, label := 0L]
+data <- data[label %in% c(0L, 1L)]
+
+# --- Feature matrix -----------------------------------------------------------
+
+predictor_file  <- "/mnt/germain/work/tomohl/pgboost-project/output/xgBoost_outputs/predictors.txt"
+predictor_names <- fread(predictor_file, header = FALSE)[[1]]
+
+feature_matrix <- as.matrix(data[, ..predictor_names])
+dmatrix        <- xgb.DMatrix(data = feature_matrix)
+
+# --- Compute SHAP values ------------------------------------------------------
+
+shap <- predict(xgb_model, dmatrix, predcontrib = TRUE)
+
+shap_dt <- as.data.table(shap)
+shap_dt[, BIAS := NULL]                      # remove bias column
+setnames(shap_dt, predictor_names)
+
+# Attach metadata
+shap_dt[, `:=`(
+  distance_bp = data$peak_gene_distance,
+  label       = data$label,
+  celltype    = data$celltype,
+  gene        = data$gene,
+  peak        = data$peak
+)]
+
+
+
+# --- Long format for SHAP values ---------------------------------------------
+
+id_columns <- c("distance_bp", "label", "celltype", "gene", "peak")
+
+long_shap <- melt(
+  shap_dt,
+  id.vars        = id_columns,
+  variable.name  = "feature",
+  value.name     = "shap_value"
+)
+
+feature_groups <- data.table(feature = predictor_names)
+
+# Internal group mapping (collapse multi-column features)
+feature_groups[, group := fifelse(
+  grepl("^tad_", feature), "TAD",
+  fifelse(grepl("^predEnhancer_", feature), "PredEnhancer", feature)
+)]
+
+feature_groups[, plot_label := fcase(
+  feature == "peak_gene_distance", "Distance to TSS",
+  feature == "ATACmean", "Peak accessibility prevalence (mean)",
+  feature == "ATACvariance", "Peak accessibility prevalence (variance)",
+  feature == "cicero", "Cicero",
+  feature == "scent", "SCENT",
+  feature == "signac", "Signac LinkPeaks",
+  feature == "gene_logCPM", "Gene expression (logCPM)",
+  feature == "peak_logCPM", "Peak accessibility (logCPM)",
+  feature == "conservation", "Conservation score",
+  feature == "closest_tss", "Binary closest link",
+  feature == "rex", "Range extender feature",
+  feature == "distNearest_peakCentric", "Candidate-centric distance score",
+  grepl("^predEnhancer_", feature), "Predicted enhancer activity",
+  grepl("^tad_", feature), "TAD scores",
+  default = feature
+)]
+
+# Merge with grouping table
+long_shap <- merge(long_shap, feature_groups[, .(feature, group, plot_label)], 
+                   by = "feature", all.x = TRUE)
+
+long_shap[is.na(group), group := feature]  # fallback: keep feature name
+
+# --- Distance binning ---------------------------------------------------------
+
+long_shap[, dist_bin := cut(
+  distance_bp,
+  breaks = c(0, 1000, 5000, 10000, 50000, 100000, 200000, 500000),
+  labels = c("1kb","5kb","10kb","50kb","100kb","200kb","500kb"),
+  include.lowest = TRUE
+)]
+
+# --- Aggregation --------------------------------------------------------------
+
+long_shap[, shap_value := as.numeric(shap_value)]
+
+agg <- long_shap[, .(
+  mean_abs = mean(abs(shap_value), na.rm = TRUE)
+), by = .(group, plot_label, dist_bin, label)]
+
+# Normalize within each distance × label bin
+agg[, rel_contrib := mean_abs / sum(mean_abs), by = .(dist_bin, label)]
+
+# Facet labels
+agg[, label := factor(label, levels = c(1, 0), labels = c("Positive", "Negative"))]
+agg[, dist_bin := factor(dist_bin,
+  levels = c("1kb","5kb","10kb","50kb","100kb","200kb","500kb"))
+]
+
+# --- Plot ---------------------------------------------------------------------
+
+okabe_ito <- c(
+  "#E69F00", "#56B4E9", "#009E73", "#F0E442",
+  "#0072B2", "#D55E00", "#CC79A7", "#999999",
+  "#009988", "#332288", "#88CCEE", "#117733",
+  "#DDCC77", "#882255", "#AA4499"
+)
+
+ggplot(agg, aes(x = dist_bin, y = rel_contrib, color = plot_label, group = plot_label)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 1.6) +
+  facet_wrap(~ label) +
+  scale_color_manual(values = okabe_ito) +
+  labs(
+    x = "Genomic distance (peak–TSS)",
+    y = "Relative SHAP contribution",
+    title = "Feature contribution by distance and label"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )
+
+agg_all <- long_shap[, .(
+  mean_abs = mean(abs(shap_value), na.rm = TRUE)
+), by = .(group, plot_label, dist_bin)]
+
+# Normalize within each distance bin
+agg_all[, rel_contrib := mean_abs / sum(mean_abs), by = dist_bin]
+
+# Plot
+ggplot(agg_all, aes(x = dist_bin, y = rel_contrib, color = plot_label, group = plot_label)) +
+  geom_line(linewidth = 1.2, alpha = 0.9) +
+  geom_point(size = 2, stroke = 0.3) +
+  scale_color_manual(values = okabe_ito, name = NULL) +
+  labs(
+    x = "Genomic distance (peak–TSS)",
+    y = "Relative feature contribution"
+  ) +
+  theme_classic(base_size = 20, base_family = "Montserrat") +
+  theme(
+    axis.text = element_text(color = "black", size = 12),
+    axis.title.x = element_text(size = 18, margin = margin(t = 10)),
+    axis.title.y = element_text(size = 18, margin = margin(r = 10)),
+    legend.position = "right",
+    legend.key = element_blank(),
+    legend.text = element_text(size = 17, lineheight = 0.9),
+    panel.grid = element_blank(),
+    panel.background = element_blank(),
+    plot.background = element_blank(),
+    axis.line = element_line(color = "black", linewidth = 0.4)
+  ) +
+  guides(
+    color = guide_legend(
+      override.aes = list(linewidth = 2, size = 2.2),
+      ncol = 1
+    )
+  ) +
+  # ← This adds the full border around the plot
+  theme(panel.border = element_rect(color = "black", fill = NA, linewidth = 0.6))
+
+```
+
+
+```{r}
+data[, pred_prob := predict(xgb_model, dmatrix)]
+
+data[, pred_label := as.integer(pred_prob > 0.5)]
+
+data[, outcome := fcase(
+  label == 1 & pred_label == 1, "True Positive",
+  label == 0 & pred_label == 0, "True Negative",
+  label == 1 & pred_label == 0, "False Negative",
+  label == 0 & pred_label == 1, "False Positive"
+)]
+
+data[, dist_bin := cut(
+  peak_gene_distance,
+  breaks = c(0, 1000, 5000, 10000, 50000, 100000, 200000, 500000),
+  labels = c("1kb","5kb","10kb","50kb","100kb","200kb","500kb"),
+  include.lowest = TRUE
+)]
+
+agg_perf <- data[, .N, by = .(dist_bin, outcome)]
+agg_perf[, total := sum(N), by = dist_bin]
+agg_perf[, frac := N / total]
+
+ggplot(agg_perf, aes(x = dist_bin, y = frac, fill = outcome)) +
+  geom_bar(stat = "identity", position = "fill", color = "black", linewidth = 0.2) +
+  scale_fill_manual(values = c(
+    "True Positive" = "#009E73",
+    "True Negative" = "#56B4E9",
+    "False Positive" = "#D55E00",
+    "False Negative" = "#CC79A7"
+  )) +
+  labs(
+    x = "Genomic distance (peak–TSS)",
+    y = "Fraction of predictions",
+    fill = "Outcome",
+    title = "Prediction outcomes across genomic distance"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "right"
+  )
+
+```
+
+```{r}
+############################################################
+# Point 3 — Model confidence vs. genomic distance
+############################################################
+
+library(ggplot2)
+library(data.table)
+
+# --- 1. Compute predicted probabilities ---------------------------------------
+data[, pred_prob := predict(xgb_model, dmatrix)]
+
+# --- 2. Bin distances ---------------------------------------------------------
+data[, dist_bin := cut(
+  peak_gene_distance,
+  breaks = c(0, 1000, 5000, 10000, 50000, 100000, 200000, 500000),
+  labels = c("1kb","5kb","10kb","50kb","100kb","200kb","500kb"),
+  include.lowest = TRUE
+)]
+
+# --- 3. Summarize model confidence per bin and label --------------------------
+conf_summary <- data[, .(
+  mean_prob = mean(pred_prob, na.rm = TRUE),
+  sd_prob   = sd(pred_prob, na.rm = TRUE),
+  n         = .N
+), by = .(dist_bin, label)]
+
+conf_summary[, se := sd_prob / sqrt(n)]
+conf_summary[, label := factor(label, levels = c(1,0), 
+                               labels = c("Positive", "Negative"))]
+
+# --- 5. Plot summary (mean ± SE) ---------------------------------------------
+ggplot(conf_summary, aes(x = dist_bin, y = mean_prob, color = label, group = label)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = mean_prob - se, ymax = mean_prob + se), width = 0.05) +
+  scale_color_manual(values = c("Positive" = "#009E73", "Negative" = "#D55E00")) +
+  labs(
+    x = "Genomic distance (peak–TSS)",
+    y = "Mean predicted probability ± SE",
+    color = "True label",
+    title = "Average model confidence by distance and label"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "right")
+
+```
+
+```{r}
+library(xgboost)
+library(data.table)
+
+# Prepare a reduced dataset with only distance
+data_dist <- data[, .(peak_gene_distance, label)]
+
+# DMatrix
+dmatrix_dist <- xgb.DMatrix(
+  data = as.matrix(data_dist[, "peak_gene_distance", with = FALSE]),
+  label = data_dist$label
+)
+
+# Train a simple distance-only model
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "aucpr",
+  max_depth = 3,
+  eta = 0.1
+)
+xgb_dist <- xgb.train(
+  params = params,
+  data = dmatrix_dist,
+  nrounds = 200,
+  verbose = 0
+)
+
+# Predict and compute AUPRC per distance bin
+data[, pred_dist := predict(xgb_dist, dmatrix_dist)]
+data[, dist_bin := cut(
+  peak_gene_distance,
+  breaks = c(0, 1000, 5000, 10000, 50000, 100000, 200000, 500000),
+  labels = c("1kb","5kb","10kb","50kb","100kb","200kb","500kb"),
+  include.lowest = TRUE
+)]
+
+# Compute AUPRC per bin
+library(PRROC)
+aupr_by_bin <- data[, {
+  pr <- pr.curve(
+    scores.class0 = pred_dist[label == 1],
+    scores.class1 = pred_dist[label == 0],
+    curve = FALSE
+  )
+  .(AUPRC = pr$auc.integral)
+}, by = dist_bin]
+
+# Plot
+ggplot(aupr_by_bin, aes(x = dist_bin, y = AUPRC, group = 1)) +
+  geom_line(linewidth = 1.1, color = "#0072B2") +
+  geom_point(size = 2, color = "#0072B2") +
+  labs(
+    x = "Genomic distance (peak–TSS)",
+    y = "AUPRC (distance-only model)",
+    title = "Predictive power of genomic distance alone"
+  ) +
+  theme_minimal(base_size = 14)
+
+```
+
