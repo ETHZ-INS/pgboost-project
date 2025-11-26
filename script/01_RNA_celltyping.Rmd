@@ -365,7 +365,7 @@ SummarizedExperiment::assays(sce_agg)$scaled_cpm <- sweep(SummarizedExperiment::
 ## Heatmap
 ```{r, fig.width=9, fig.height=4}
 
-# 1) Prepare marker table (uppercase)
+# prepare marker table (uppercase)
 markerGenes_upper <- toupper(unlist(markerGenes, use.names = FALSE))
 marker_df <- data.table(
   Symbol = markerGenes_upper,
@@ -373,20 +373,20 @@ marker_df <- data.table(
 )
 marker_df <- unique(marker_df, by = "Symbol")
 
-# 2) Pick rows present in aggregated object
+# pick rows present in aggregated object
 keep_idx <- which(rowData(sce_agg)$SYMBOL_UPPER %in% marker_df$Symbol)
 if (length(keep_idx) == 0L) stop("None of the marker genes were found in sce_agg.")
 
-# 3) Extract matrix (scaled CPM) and set readable rownames
+# extract matrix (scaled CPM) and set readable rownames
 stopifnot("scaled_cpm" %in% assayNames(sce_agg))
 mat <- assays(sce_agg)$scaled_cpm[keep_idx, , drop = FALSE]
 rownames(mat) <- rowData(sce_agg)$SYMBOL_UPPER[keep_idx]
 
-# 4) Build row annotation aligned to mat
+# build row annotation aligned to mat
 marker_aln <- marker_df[match(rownames(mat), marker_df$Symbol)]
 annoRow <- data.frame(type = marker_aln$Type, row.names = rownames(mat))
 
-# 5) Order rows by marker type for nicer display
+# order rows by marker type for nicer display
 ord <- order(annoRow$type)
 mat_ord <- mat[ord, , drop = FALSE]
 annoRow_ord <- annoRow[ord, , drop = FALSE]

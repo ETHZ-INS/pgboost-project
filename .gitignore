@@ -1,4 +1,7 @@
 /data/*
 !/data/celltypes.tsv
+!/data/TSS.txt.gz
+!/data/hg38.chrom.sizes
+
 
 /output/

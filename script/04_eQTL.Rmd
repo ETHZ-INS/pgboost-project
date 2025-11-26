@@ -30,11 +30,6 @@ EQTL_DIR  <- file.path(DATA_DIR, "eqtl_files")
 dir.create(EQTL_DIR, showWarnings = FALSE)
 ```
 
-# 2. Load Existing Seurat
-```{r}
-seo <- readRDS(file.path(DATA_DIR, "seo_annotated_paper.rds"))
-barcodes <- colnames(seo)
-```
 
 # 3. eQTL
 ## Download eQTL's
@@ -54,278 +49,268 @@ for (f in files) {
 }
 ```
 
-## Candidate Links
+# 2. Load Existing Seurat
 ```{r}
-# Peaks
-peaks <- readRDS(file.path(DATA_DIR, "consensus_peak_set.rds"))
+# 2. Load Existing Seurat
+seo <- readRDS(file.path(DATA_DIR, "seo_RNA_ATAC_chr123.rds"))
+barcodes <- colnames(seo)
+
+DefaultAssay(seo) <- "ATAC"
+atac <- GetAssayData(seo, slot = "counts")
+
+# Build GRanges and table
+peak_tbl <- tstrsplit(rownames(atac), "-", keep = 1:3)
+peak_tbl <- data.table(
+  peak  = rownames(atac),
+  chr   = peak_tbl[[1]],
+  start = as.integer(peak_tbl[[2]]),
+  end   = as.integer(peak_tbl[[3]])
+)[, mid := (start + end) %/% 2L]
+
+peaks <- GRanges(seqnames = peak_tbl$chr,
+                 ranges   = IRanges(peak_tbl$start, peak_tbl$end))
+mcols(peaks)$peak <- peak_tbl$peak
 GenomeInfoDb::seqlevelsStyle(peaks) <- "UCSC"
-peaks <- GenomeInfoDb::keepStandardChromosomes(peaks, pruning.mode = "coarse")
-
-# work only on chr1–3
 peaks <- peaks[as.character(seqnames(peaks)) %in% c("chr1","chr2","chr3")]
-
-# Peak midpoints & IDs 
-peak_centers <- GenomicRanges::resize(peaks, width = 1, fix = "center")
-peak_centers$peak_id <- paste0(as.character(seqnames(peak_centers)), ":", start(peak_centers))
-
-# ±500 kb windows around peak centers
-peak_window <- GenomicRanges::resize(peak_centers, width = 1e6 + 1, fix = "center")
-
-# Protein-coding TSS (one per gene)
-ensdb <- EnsDb.Hsapiens.v86
-genes_db <- genes(ensdb, filter = ~ gene_biotype == "protein_coding")
-
-# Define canonical TSS per gene (choose min coordinate for '+' strand, max for '-' strand)
-tss_pos <- ifelse(strand(genes_db) == "+", start(genes_db), end(genes_db))
-tss <- GRanges(
-  seqnames = seqnames(genes_db),
-  ranges   = IRanges(start = tss_pos, width = 1),
-  strand   = strand(genes_db),
-  gene_id  = genes_db$gene_id
-)
-
-GenomeInfoDb::seqlevelsStyle(tss) <- "UCSC"
-tss <- GenomeInfoDb::keepStandardChromosomes(tss, pruning.mode = "coarse")
-
-dt <- data.table::as.data.table(tss)
-# choose most upstream per gene: min(start) for '+', max(start) for '-'
-dt[, key := ifelse(as.character(strand) == "+", start, -start)]
-tss_one_dt <- dt[order(gene_id, key), .SD[1], by = gene_id]
-
-tss <- GRanges(tss_one_dt$seqnames,
-               IRanges(start = tss_one_dt$start, width = 1),
-               strand  = tss_one_dt$strand,
-               gene_id = tss_one_dt$gene_id)
-
-# Harmonize seqlevels between peak_window and tss
-common_seq <- intersect(seqlevels(peak_window), seqlevels(tss))
-peak_window <- GenomeInfoDb::keepSeqlevels(peak_window, common_seq, pruning.mode = "coarse")
-tss         <- GenomeInfoDb::keepSeqlevels(tss,         common_seq, pruning.mode = "coarse")
-
-# Overlaps: any TSS within ±500 kb of a peak center
-hits <- GenomicRanges::findOverlaps(peak_window, tss, ignore.strand = TRUE)
-
-candidates <- data.table::data.table(
-  peak_id = peak_window$peak_id[S4Vectors::queryHits(hits)],
-  gene_id = tss$gene_id[S4Vectors::subjectHits(hits)]
-)
-
-# De-duplicate pairs, ensure chr1–3 only 
-candidates <- unique(candidates)
-candidates <- candidates[grepl("^chr[123]:", peak_id)]
-
-# Save compressed and report
-out <- file.path(DATA_DIR, "candidate_peak_gene_pairs_chr123.tsv")
-data.table::fwrite(candidates, out, sep = "\t")
-message("Saved ", nrow(candidates), " candidate peak–gene pairs (chr1–3) to: ", out)
-
 ```
 
-
-## Labeling
+## Candidate Links
 ```{r}
-label_snppg_pairs <- function(
-  cell_type,
-  candidate_file       = file.path(DATA_DIR, "candidate_peak_gene_pairs_chr123.tsv"),
-  eqtl_dir             = EQTL_DIR,
-  consensus_peaks_file = file.path(DATA_DIR, "consensus_peak_set.rds"),
-  output_file          = NULL,
-  pos_cutoff    = 1e-6,
-  neg_cutoff    = 0.4,
-  power_cutoff  = 0.01
-) {
-  message("Generating SNP–peak–gene labels for: ", cell_type)
+labels <- c("astrocytes","endothelial","Neurons","Microglia","Oligodendrocytes","OPC")
 
-  eqtl_path <- file.path(eqtl_dir, paste0(cell_type, "_eqtl_full_assoc.tsv.gz"))
-  if (!file.exists(eqtl_path)) {
-    message("  → Skipping ", cell_type, " (missing: ", basename(eqtl_path), ")")
-    return(NULL)
+ensdb    <- EnsDb.Hsapiens.v86
+genes_db <- genes(ensdb, filter = ~ gene_biotype == "protein_coding")
+tss_pos  <- ifelse(strand(genes_db)=="+", start(genes_db), end(genes_db))
+gr_tss   <- GRanges(seqnames=seqnames(genes_db), ranges=IRanges(tss_pos, width=1),
+                    strand=strand(genes_db), gene_id=genes_db$gene_id)
+GenomeInfoDb::seqlevelsStyle(gr_tss) <- "UCSC"
+gr_tss <- keepStandardChromosomes(gr_tss, pruning.mode="coarse")
+
+link_kb <- 500; prom_kb <- 1
+gr_link <- promoters(gr_tss, upstream=link_kb*1000, downstream=link_kb*1000)
+mcols(gr_link)$gene_id <- mcols(gr_tss)$gene_id
+gr_prom <- promoters(gr_tss, upstream=prom_kb*1000, downstream=prom_kb*1000)
+
+# promoter-overlapping peaks 
+ov_prom     <- findOverlaps(peaks, gr_prom, ignore.strand=TRUE)
+prom_peaks  <- unique(mcols(peaks)$peak[queryHits(ov_prom)])
+
+# Seurat object to define presence per CT
+stopifnot("cell_type_manual" %in% colnames(seo@meta.data))
+seo <- subset(seo, cells = rownames(seo@meta.data)[seo@meta.data$cell_type_manual %in% labels])
+seo@meta.data$cell_type_manual <- factor(seo@meta.data$cell_type_manual, levels=labels)
+
+DefaultAssay(seo) <- "ATAC"
+atac <- GetAssayData(seo, "ATAC", "counts")
+
+DefaultAssay(seo) <- "RNA"
+rna <- GetAssayData(seo, "RNA", "counts")
+
+min_peak_frac <- 0.0 
+min_gene_frac <- 0.0  
+
+
+make_ct_labels <- function(ct_code, ct_file_codes) {
+  message("CT: ", ct_code)
+  cells <- rownames(seo@meta.data)[seo@meta.data$cell_type_manual == ct_code]
+  if (!length(cells)) { message("  No cells for ", ct_code); return(NULL) }
+
+  ## peaks present in this CT
+  atac_ct    <- atac[, cells, drop=FALSE]
+  keep_peaks <- rownames(atac_ct)[ Matrix::rowMeans(atac_ct > 0) >= min_peak_frac ]
+  keep_peaks <- intersect(keep_peaks, peak_tbl$peak)
+  peaks_ct   <- peaks[mcols(peaks)$peak %in% keep_peaks]
+
+  ## genes present in this CT
+  rna_ct        <- rna[, cells, drop=FALSE]
+  gene_present  <- rownames(rna_ct)[ Matrix::rowMeans(rna_ct > 0) >= min_gene_frac ]
+  if (!all(grepl("^ENSG", gene_present))) {
+    map <- AnnotationDbi::select(ensdb, keys=unique(gene_present),
+                                 keytype="SYMBOL", columns="GENEID")
+    map <- unique(map[!is.na(map$GENEID), ])
+    gene_present_ensg <- unique(map$GENEID)
+  } else gene_present_ensg <- unique(gene_present)
+  gr_tss_ct <- gr_tss[mcols(gr_tss)$gene_id %in% gene_present_ensg]
+  if (length(peaks_ct) == 0L || length(gr_tss_ct) == 0L) { message("  No peaks/genes for ", ct_code); return(NULL) }
+
+  ## TSS-centered candidates minus promoter peaks
+  gr_link_ct <- promoters(gr_tss_ct, upstream=link_kb*1000, downstream=link_kb*1000)
+  mcols(gr_link_ct)$gene_id <- mcols(gr_tss_ct)$gene_id
+  ov_ct <- findOverlaps(peaks_ct, gr_link_ct, ignore.strand=TRUE)
+  cand <- unique(data.table(
+    peak    = mcols(peaks_ct)$peak[queryHits(ov_ct)],
+    gene_id = mcols(gr_link_ct)$gene_id[subjectHits(ov_ct)]
+  ))
+  cand <- cand[ !peak %in% prom_peaks ]
+  # add chr/tss/mid + distance filter
+  cand <- merge(cand, peak_tbl[, .(peak, chr, mid)], by="peak", all.x=TRUE)
+  tss_dt <- as.data.table(gr_tss_ct)[, .(gene_id, chr_tss=as.character(seqnames), tss=start)]
+  cand   <- merge(cand, tss_dt, by="gene_id", all.x=TRUE)
+  cand[, peak_gene_distance := abs(mid - tss)]
+  cand <- cand[ peak_gene_distance < link_kb*1000 ][, c("mid","tss") := NULL ]
+  if (!nrow(cand)) { message("  No (peak,gene) candidates for ", ct_code); return(NULL) }
+
+  ## read eQTL for this CT (possibly multiple sources, e.g. Ext+IN)
+  read_one <- function(code) {
+    p <- file.path(EQTL_DIR, paste0(code, "_eqtl_full_assoc.tsv.gz"))
+    if (!file.exists(p)) { message("  Missing eQTL file: ", basename(p)); return(NULL) }
+    fread(p, select=c("feature","variant_id","Fixed_P","chr","pos"))
   }
-  if (is.null(output_file)) {
-    output_file <- file.path(eqtl_dir, paste0("training_data_snppg_", cell_type, "_chr123.tsv.gz"))
-  }
+  eqtl_list <- lapply(ct_file_codes, read_one)
+  eqtl_list <- Filter(Negate(is.null), eqtl_list)
+  if (!length(eqtl_list)) return(NULL)
 
-  # candidates (peak_id = chr:mid ; gene_id = ENSG)
-  cand <- data.table::fread(candidate_file)
-  stopifnot(all(c("peak_id","gene_id") %in% names(cand)))
-  data.table::setkey(cand, peak_id, gene_id)
-
-  # peaks + a lookup to get chr-start-end later
-  peaks <- readRDS(consensus_peaks_file)
-  GenomeInfoDb::seqlevelsStyle(peaks) <- "UCSC"
-  peak_mid  <- start(peaks) + floor((width(peaks) - 1L)/2L)
-  LUT_peaks <- data.table(
-    peak_id   = paste0(as.character(seqnames(peaks)), ":", peak_mid),
-    peak_full = sprintf("%s-%d-%d",
-                        as.character(seqnames(peaks)), start(peaks), end(peaks))
-  )
-  setkey(LUT_peaks, peak_id)
-
-  # eQTLs
-  eqtl <- data.table::fread(eqtl_path, select = c("feature","variant_id","Fixed_P","chr","pos"))
+  eqtl <- rbindlist(eqtl_list, use.names=TRUE, fill=TRUE)
   eqtl[, gene_id := sub("\\..*", "", feature)]
-  if (!all(grepl("^chr", unique(eqtl$chr)))) eqtl[, chr := paste0("chr", chr)]
+  if (!all(grepl("^chr", eqtl$chr))) eqtl[, chr := paste0("chr", chr)]
 
-  # labels at SNP–gene level
-  strong <- eqtl[Fixed_P < power_cutoff]
+  ## If same (variant,gene) appears multiple times (Ext vs IN), keep min p
+  setorder(eqtl, variant_id, gene_id, Fixed_P)
+  eqtl <- eqtl[, .SD[1L], by = .(variant_id, gene_id)]
+
+  ## label rule on collapsed eQTLs
+  pos_cutoff <- 1e-6; strong_cut <- 1e-2; neg_cutoff <- 0.4
+  strong <- eqtl[Fixed_P < strong_cut]
   eqtl[, label := fifelse(Fixed_P < pos_cutoff, 1L,
                    fifelse(Fixed_P > neg_cutoff &
                            variant_id %in% strong$variant_id &
                            gene_id   %in% strong$gene_id, 2L, 3L))]
 
-  # map SNPs to peaks
-  snp_gr <- GenomicRanges::GRanges(seqnames = eqtl$chr,
-                                   ranges   = IRanges::IRanges(start = eqtl$pos, width = 1))
-  hits <- GenomicRanges::findOverlaps(snp_gr, peaks)
+  ## SNP ↔ peaks of this CT
+  snp_gr  <- GRanges(seqnames=eqtl$chr, ranges=IRanges(eqtl$pos, width=1))
+  hits_ct <- findOverlaps(snp_gr, peaks_ct, ignore.strand=TRUE)
+  if (!length(hits_ct)) { message("  No SNP↔peak overlaps for ", ct_code); return(NULL) }
 
-  peak_id_vec <- paste0(
-    GenomicRanges::seqnames(peaks)[S4Vectors::subjectHits(hits)], ":",
-    GenomicRanges::start  (peaks)[S4Vectors::subjectHits(hits)] +
-      floor((GenomicRanges::width(peaks)[S4Vectors::subjectHits(hits)] - 1) / 2)
+  peak_str_ct <- sprintf("%s-%d-%d",
+                         as.character(seqnames(peaks_ct))[subjectHits(hits_ct)],
+                         start(peaks_ct)[subjectHits(hits_ct)],
+                         end(peaks_ct)[subjectHits(hits_ct)])
+
+  snppg <- data.table(
+    variant_id = eqtl$variant_id[queryHits(hits_ct)],
+    chr        = eqtl$chr       [queryHits(hits_ct)],
+    pos        = eqtl$pos       [queryHits(hits_ct)],
+    gene_id    = eqtl$gene_id   [queryHits(hits_ct)],
+    Fixed_P    = eqtl$Fixed_P   [queryHits(hits_ct)],
+    label      = eqtl$label     [queryHits(hits_ct)],
+    peak       = peak_str_ct
   )
 
-  snppg <- data.table::data.table(
-    variant_id = eqtl$variant_id[S4Vectors::queryHits(hits)],
-    chr        = eqtl$chr       [S4Vectors::queryHits(hits)],
-    pos        = eqtl$pos       [S4Vectors::queryHits(hits)],
-    gene_id    = eqtl$gene_id   [S4Vectors::queryHits(hits)],
-    Fixed_P    = eqtl$Fixed_P   [S4Vectors::queryHits(hits)],
-    label      = eqtl$label     [S4Vectors::queryHits(hits)],
-    peak_id    = peak_id_vec
-  )
+  ## keep only CT (peak,gene) candidates (chr join is redundant but ok)
+  setkey(snppg, peak, gene_id, chr)
+  setkey(cand,  peak, gene_id, chr)
+  snppg <- snppg[cand, nomatch=0]
+  if (!nrow(snppg)) { message("  No SNP–peak–gene after CT filtering for ", ct_code); return(NULL) }
 
-  # keep only (peak_id, gene_id) within ±500kb universe
-  data.table::setkey(snppg, peak_id, gene_id)
-  snppg <- snppg[cand, nomatch = 0]
+  snppg[, snp := sprintf("%s-%d-%d", chr, as.integer(pos)-1L, as.integer(pos))]
+  snppg[, celltype := ct_code]
 
-  # add SNP string "chr-(pos-1)-pos"
-  snppg[, snp := sprintf("%s-%s-%s", chr, as.integer(pos) - 1L, as.integer(pos))]
+  ## aggregate: one SNP with lowest p per (peak,gene_id,celltype)
+  setorder(snppg, Fixed_P)
+  snppg_agg <- snppg[, .SD[1L], by = .(peak, gene_id, celltype)]
 
-  # add celltype
-  snppg[, celltype := cell_type]
+  ## map SYMBOL **after** aggregation
+  sym <- AnnotationDbi::select(ensdb, keys=unique(snppg_agg$gene_id),
+                               keytype="GENEID", columns="SYMBOL")
+  sym <- unique(data.table(gene_id=sym$GENEID, gene=sym$SYMBOL))
+  setkey(sym, gene_id); setkey(snppg_agg, gene_id)
+  snppg_agg <- sym[snppg_agg]
+  snppg_agg[is.na(gene) | gene=="", gene := gene_id]
 
-  # join peak_full -> new column 'peak' (chr-start-end)
-  setkey(snppg, peak_id)
-  snppg <- LUT_peaks[snppg]
-  snppg[, peak := peak_full][, peak_full := NULL]
-
-  # map Ensembl gene_id -> HGNC symbol into new column 'gene'
-  sym <- ensembldb::select(EnsDb.Hsapiens.v86,
-                           keys     = unique(snppg$gene_id),
-                           keytype  = "GENEID",
-                           columns  = c("SYMBOL","GENEID"))
-  sym <- unique(data.table(gene_id = sym$GENEID, gene = sym$SYMBOL))
-  setkey(sym, gene_id)
-  setkey(snppg, gene_id)
-  snppg <- sym[snppg]
-  
-  missing <- snppg[is.na(gene) | gene == "", unique(gene_id)]
-  if (length(missing) > 0) {
-    message("These gene_ids had no HGNC symbol: ", paste(missing, collapse = ", "))
-  }
-  snppg[is.na(gene) | gene == "", gene := gene_id]
-
-  # final columns 
-  out <- snppg[, .(
-    snp,
-    peak,                 
-    peak_id,              
-    gene,                 
-    gene_id,
-    celltype,
-    variant_id,
-    chr, pos,
-    Fixed_P,
-    label
-  )]
-
-  # sanity
-  cnt <- out[, .N, by = label][order(label)]
-  message("  Labels: ", paste(sprintf("%d→%d", cnt$label, cnt$N), collapse = ", "))
-
-  data.table::fwrite(out, output_file, sep = "\t")
-  message("  → Saved: ", output_file, " (n = ", nrow(out), ")")
-  invisible(out)
+  ## final return
+  snppg_agg[, .(peak, gene_id, gene, celltype, label, Fixed_P)]
 }
 
-```
 
-## Label all available cell types + subset PeakMatrix per type (label 1/2)
+ct_map <- data.table(
+  ct_code   = c("Neurons","astrocytes","endothelial","Microglia","Oligodendrocytes","OPC"),
+  eqtl_name = I(list(c("Ext","IN"), "Ast","End","MG","OD","OPC"))
+)
+
+all_lab <- rbindlist(lapply(seq_len(nrow(ct_map)), function(i)
+  make_ct_labels(ct_map$ct_code[i], ct_map$eqtl_name[[i]])),
+  use.names = TRUE, fill = TRUE)
+
+# Sanity checks
+dup_summary <- all_lab[, .N, by=.(peak, gene_id, celltype)][N > 1]
+cat("Remaining duplicated (peak,gene_id,celltype): ", nrow(dup_summary), "\n")
+
+# Save
+out_path <- file.path(EQTL_DIR, "training_data_snppg_aggregated_new.tsv.gz")
+fwrite(all_lab[, .(peak, gene_id, gene, celltype, label, Fixed_P)], out_path, sep="\t")
+cat("Wrote: ", out_path, " (", nrow(all_lab), " rows)\n", sep="")
+
+# Optional: assert file exists
+stopifnot(file.exists(out_path))
+```
+# Numbers for Thesis
 ```{r}
-# One combined training file with all cell types 
-cell_types_run <- c("OD","OPC","Ast","IN","Ext","MG","End")
+data_file      <- file.path(XGB_DIR, "data_noSNP.tsv")
+training_file  <- file.path(PROJECT_ROOT, "data", "eqtl_files", "training_data_snppg_aggregated_new.tsv.gz")
 
-all_snppg <- list()
-for (ct in cell_types_run) {
-  res <- label_snppg_pairs(
-    cell_type            = ct,
-    candidate_file       = file.path(DATA_DIR, "candidate_peak_gene_pairs_chr123.tsv"),
-    eqtl_dir             = EQTL_DIR,
-    consensus_peaks_file = file.path(DATA_DIR, "consensus_peak_set.rds"),
-    output_file          = file.path(EQTL_DIR, paste0("training_data_snppg_", ct, "_chr123.tsv.gz"))
-  )
-  if (!is.null(res)) all_snppg[[ct]] <- res[]
-}
+full_data     <- fread(data_file)
+training_data <- fread(training_file)
 
-training_all <- data.table::rbindlist(all_snppg, use.names = TRUE, fill = TRUE)
-out_all <- file.path(EQTL_DIR, "training_data_snppg_ALL_chr123.tsv.gz")
-data.table::fwrite(training_all, out_all, sep = "\t")
-message("→ Saved combined training file: ", out_all,
-        " (n = ", nrow(training_all), ")")
-```
+ct_map <- c(
+  Ast = "astrocytes",
+  MG  = "Microglia",
+  OD  = "Oligodendrocytes",
+  OPC = "OPC",
+  IN  = "Neurons",     # fuse IN  → Neurons
+  Ext = "Neurons",     # fuse Ext → Neurons
+  End = "Endothelial"
+)
+remap_ct <- function(x) ifelse(x %in% names(ct_map), ct_map[x], x)
 
-# 4. Subset PeakMatrix
+training_data[, celltype := remap_ct(celltype)]
+full_data[,     celltype := remap_ct(celltype)]
 
-```{r}
-# Create one chr1–3 PeakMatrix file
-consensus_peaks <- readRDS(file.path(DATA_DIR, "consensus_peak_set.rds"))
-GenomeInfoDb::seqlevelsStyle(consensus_peaks) <- "UCSC"
+full_data[, chr := tstrsplit(peak, "-", keep = 1L)]
+training_data[, chr := tstrsplit(peak, "-", keep = 1L)]
 
-# chr1–3 index 
-chr_idx <- which(as.character(seqnames(consensus_peaks)) %in% c("chr1","chr2","chr3"))
-stopifnot(length(chr_idx) > 0)
-consensus_peaks_chr123 <- consensus_peaks[chr_idx]
+# --- Merge on complete identity (peak, gene, celltype, chr) ---
+index_cols <- c("peak", "gene", "celltype", "chr")
+setkeyv(full_data, index_cols)
+setkeyv(training_data, index_cols)
 
-# Load full PeakMatrix (rows = peaks)
-peak_mat_path <- file.path(DATA_DIR, "peak_matrices", "PeakMatrix-1.h5ads")
-pm <- zellkonverter::readH5AD(peak_mat_path, use_hdf5 = TRUE)
+data <- full_data[training_data, nomatch = 0L]
 
-#Adapt Peakmatrix start to 1-based
-pm_ids <- rownames(pm)
-parts <- tstrsplit(pm_ids, "[:-]")   
-chr   <- parts[[1]]
-start <- as.integer(parts[[2]]) + 1  # convert to 1-based
-end   <- as.integer(parts[[3]])
+# --- Convert labels (1 = pos, 2 = strong neg → 0) and restrict to binary cases ---
+data[label == 2L, label := 0L]
+data <- data[label %in% c(0L, 1L)]
 
-rownames(pm) <- paste0(chr, "-", start, "-", end)
+# --- Dataset summary ---
+cat("\n=== Merged dataset summary ===\n")
 
-# Build the expected rowname strings from the *chr1–3 peaks*
-target_ids <- sprintf("%s-%d-%d",
-                      as.character(seqnames(consensus_peaks_chr123)),
-                      start(consensus_peaks_chr123),
-                      end(consensus_peaks_chr123))
+total_before <- nrow(training_data)
+total_after  <- nrow(data)
+lost <- total_before - total_after
+lost_frac <- 100 * lost / total_before
 
-# Match those to H5AD rownames
-match_idx <- match(target_ids, rownames(pm))
-if (anyNA(match_idx)) {
-  na_n <- sum(is.na(match_idx))
-  stop("Could not match ", na_n, " chr1–3 consensus peaks to H5AD rows. ",
-       "Check that both files use the same peak definitions/naming.")
-}
+pos <- sum(data$label == 1)
+neg <- sum(data$label == 0)
+celltypes <- uniqueN(data$celltype)
+meta_cols <- c("peak", "gene", "celltype", "chr", "label")
+n_features <- ncol(data) - length(meta_cols)
 
-pm_chr <- pm[match_idx, ]
+cat(sprintf("  Total labeled examples (before merge): %s\n", format(total_before, big.mark=",")))
+cat(sprintf("  Retained after merge: %s (%.1f%%)\n", format(total_after, big.mark=","), 100 - lost_frac))
+cat(sprintf("  Rows lost (missing feature coverage): %s (%.1f%%)\n", format(lost, big.mark=","), lost_frac))
+cat(sprintf("  Positives: %s (%.2f%%)\n", format(pos, big.mark=","), 100*pos/total_after))
+cat(sprintf("  Negatives: %s (%.2f%%)\n", format(neg, big.mark=","), 100*neg/total_after))
+cat(sprintf("  Cell types: %d\n", celltypes))
+cat(sprintf("  Features per example: %d\n", n_features))
+cat("=================================\n\n")
 
-assay_name <- intersect(c("X","counts"), names(assays(pm_chr)))[1]
-if (is.na(assay_name)) assay_name <- names(assays(pm_chr))[1]
+unique(training_data$celltype)
+unique(full_data$celltype)
 
-out_h5ad <- file.path(DATA_DIR, "peak_matrices", "PeakMatrix-1-chr123.h5ad")
-zellkonverter::writeH5AD(pm_chr, file = out_h5ad, X_name = assay_name)
-message("Wrote full subsetted object to: ", out_h5ad,
-        "  (rows=", nrow(pm_chr), ", cols=", ncol(pm_chr), ")")
+unique(training_data$chr)
+unique(full_data$chr)
 
-saveRDS(consensus_peaks_chr123, file.path(DATA_DIR, "consensus_peak_set_chr123.rds"))
-message("Saved matching chr1–3 peaks (n=", length(consensus_peaks_chr123), ").")
+table(training_data$chr)         
+table(full_data$chr)            
+
 
 ```
-
 

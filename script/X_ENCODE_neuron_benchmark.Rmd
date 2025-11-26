@@ -314,40 +314,56 @@ for(res in all_results) {
       "(", round(100*res$n_tp/res$n_total, 2), "%)\n", sep="")
 }
 ```
-```{r}
-# 1) Load and keep only what's needed from the raw feature table
-feat <- fread("/mnt/germain/work/tomohl/pgboost-project/output/xgBoost_outputs/data_noSNP.tsv")[
-  , .(peak, gene, peak_gene_distance, celltype)
-]
+```{r fig.width=8, fig.height=6}
+# Store the baseline value for cleaner code
+baseline_value <- all_results[[1]]$baseline
 
-# 2) Deduplicate (in case the same peak–gene appears multiple times in the raw table)
-#    If there are multiple distances per pair, take the median to be robust.
-feat_agg <- feat[, .(peak_gene_distance = median(peak_gene_distance, na.rm = TRUE)), by = .(peak, gene, celltype)]
-
-# 3) Merge predictions with the (deduped) feature distances
-test <- merge(pred_neurons_allParams_tuned, feat_agg, by = c("peak", "gene", "celltype"), all.x = TRUE)
-
-# 4) Quick sanity checks
-test[, dups := .N, by = .(peak, gene, celltype)]
-message("Rows after merge: ", nrow(test))
-message("Missing distances: ", sum(is.na(test$peak_gene_distance)))
-message("Any duplicated peak–gene pairs post-merge? ", any(test$dups > 1))
-
-# 5) Plot: probability vs distance (log-scaled distance helps)
-ggplot(test[!is.na(peak_gene_distance)], aes(x = peak_gene_distance, y = prob)) +
-  geom_hex(bins = 60) +
-  scale_fill_viridis_c(option = "C", direction = -1) +
-  geom_smooth(method = "loess", color = "white", size = 1.2) +
-  scale_x_log10() +
-  labs(
-    x = "Peak–gene distance (bp, log scale)",
-    y = "Predicted probability",
-    subtitle = "Density of predicted links by genomic distance"
+p_pr_compare <- ggplot(all_pr_data, aes(x = recall, y = precision, color = model)) +
+  geom_line(size = 1.2) +
+  xlim(0, 0.2) +
+  scale_color_manual(values = sapply(all_results, function(x) x$color)) +
+  geom_hline(
+    yintercept = baseline_value, # Use the stored value
+    linetype = "dashed", color = "gray50", alpha = 0.7
   ) +
-  theme_bw(base_size = 16) +
+  # --- ANNOTATION FIX IS HERE ---
+  annotate(
+    "text",
+    x = 0.18, # x-coordinate to place the text (near the right edge of xlim(0, 0.2))
+    y = baseline_value, # y-coordinate is the baseline value itself
+    label = paste0("Baseline: ", round(baseline_value, 4)),
+    vjust = -0.5, # Adjust vertically slightly above the line
+    hjust = 1,    # Right-align the text
+    color = "gray30",
+    size = 5, # Adjust size as needed
+    family = "montserrat_family"
+  ) +
+  # --- END ANNOTATION FIX ---
+  labs(
+    title = NULL,
+    subtitle = paste(sapply(all_results, function(x)
+      paste0(x$model, ": AUPRC=", round(x$auprc, 3))), collapse = " | "),
+    x = "Recall",
+    y = "Precision",
+    color = NULL
+  ) +
+  theme_bw(base_size = 17, base_family = "montserrat_family") +
   theme(
     panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank()
+    panel.grid.minor = element_blank(),
+    plot.title = element_blank(),
+    plot.subtitle = element_text(face = "plain", family = "montserrat_family"),
+    axis.text.x = element_text(family = "montserrat_family"),
+    axis.text.y = element_text(family = "montserrat_family"),
+    # --- LEGEND FIX IS HERE ---
+    legend.position = "bottom",
+    legend.justification = "center", # Center the legend when at the bottom
+    legend.background = element_rect(fill = scales::alpha("white", 0.8), color = NA),
+    legend.key = element_blank(),
+    legend.direction = "horizontal", # Align items horizontally
+    plot.background = element_blank()
   )
+
+print(p_pr_compare)
 ```
 
